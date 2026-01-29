@@ -1,979 +1,1809 @@
 #!/usr/bin/env python3
 """
-BACKTEST ENGINE v14.0 - FULL MODE OPTIMIZED
-Optimisé pour l'exécution complète avec performance améliorée
+BACKTEST ENGINE v15.0 - GÉNÉRATEUR DE DATASET POUR IA
+Toutes les stratégies brute force, aucune interprétation, données brutes seulement
 """
 
 import pandas as pd
 import numpy as np
+import ccxt
+import yfinance as yf
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, asdict
-from multiprocessing import Pool, Manager, cpu_count
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, asdict, field
 import json
 import time
 import warnings
-import pickle
+import multiprocessing as mp
+from multiprocessing import Pool, Manager, cpu_count
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import pyarrow as pa
+import pyarrow.parquet as pq
+from collections import defaultdict
+import gc
 import hashlib
+import os
+from tqdm import tqdm
+
 warnings.filterwarnings('ignore')
 
-try:
-    import yfinance as yf
-    HAS_YFINANCE = True
-except ImportError:
-    HAS_YFINANCE = False
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
+@dataclass
 class Config:
-    # Actifs (réduits pour le FULL mode optimisé)
-    CRYPTO_TICKERS = {'BTC/USD': 'BTC-USD', 'ETH/USD': 'ETH-USD'}  # 2 cryptos au lieu de 3
-    STOCK_TICKERS = ['AAPL', 'TSLA', 'NVDA']  # 3 actions au lieu de 6
+    """Configuration complète du backtest v15"""
     
-    # Timeframes (réduits pour optimisation)
-    TIMEFRAMES = {'H1': '1h', 'H4': '4h', 'D1': '1d', 'W1': '1wk'}  # 4 au lieu de 6
+    # === DONNÉES ===
+    CRYPTO_TICKERS = [
+        'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT',
+        'SOL/USDT', 'DOGE/USDT', 'DOT/USDT', 'AVAX/USDT', 'LTC/USDT'
+    ]
     
-    LOOKBACK_PERIODS = {'H1': '729d', 'H4': '729d', 'D1': '1825d', 'W1': '3650d'}
-    MIN_BARS = {'H1': 1000, 'H4': 800, 'D1': 500, 'W1': 200}
-    WARMUP_BARS = 200
+    STOCK_TICKERS = [
+        'AAPL', 'TSLA', 'NVDA', 'MSFT', 'GOOGL',
+        'AMZN', 'META', 'JPM', 'V', 'WMT'
+    ]
     
-    # Paramètres optimisés pour FULL mode
-    RSI_BUY_RANGE = list(range(20, 41, 3))  # 7 valeurs: 20, 23, 26, 29, 32, 35, 38
-    EMA_PERIODS = [10, 20, 30, 50, 100, 150, 200]  # 7 périodes au lieu de 11
-    BB_PERIODS = [15, 20, 30, 50]  # 4 périodes au lieu de 7
-    BB_MULTIPLIERS = [1.5, 2.0, 2.5, 3.0]  # 4 multiplicateurs
+    TIMEFRAMES = {
+        'M15': '15m', 'H1': '1h', 'H4': '4h', 'D1': '1d', 'W1': '1w'
+    }
     
-    # Paramètres de risque
-    INITIAL_CAPITAL = 10000.0
-    RISK_PER_TRADE = 0.02
-    MAX_POSITION_PCT = 0.15
-    ATR_SL_MULTIPLIERS = [2.0, 2.5, 3.0]
-    ATR_TP_MULTIPLIERS = [3.0, 3.5, 4.0]
-    MAX_BARS_HOLD = [15, 30, 50]
+    YEARS_OF_DATA = 5
+    LOOKBACK_DAYS = {
+        'M15': 365 * 5, 'H1': 365 * 5, 'H4': 365 * 5, 
+        'D1': 365 * 5, 'W1': 365 * 5
+    }
     
-    # Coûts
-    COMMISSIONS = {'H1': 0.0003, 'H4': 0.0002, 'D1': 0.0001, 'W1': 0.0001}
-    SLIPPAGE = {'H1': 0.0001, 'H4': 0.00005, 'D1': 0.00002, 'W1': 0.00001}
+    # === STRATÉGIES BRUTE FORCE ===
+    # RSI
+    RSI_PERIODS = [7, 14, 21, 28]
+    RSI_BUY_VALUES = list(range(0, 46))      # 0-45
+    RSI_SELL_VALUES = list(range(55, 101))   # 55-100
+    RSI_SIGNAL_TYPES = ['CROSS', 'CROSS_CONFIRM', 'REVERSION', 'DIVERGENCE']
     
-    # Filtres
-    MIN_TRADES = 5
-    MIN_VOLUME_RATIO = 0.1
+    # EMA
+    EMA_PERIODS = list(range(5, 201, 5))     # 5 à 200 par pas de 5
+    EMA_TYPES = ['TOUCH', 'CROSSOVER', 'FAST_SLOW_CROSS', 'CLUSTER', 'DISTANCE']
+    EMA_FAST_SLOW_COMBOS = [(5,20), (10,30), (20,50), (50,100), (100,200)]
     
-    # Performance
-    CPU_CORES = cpu_count()
-    WORKERS = max(1, min(CPU_CORES - 1, 8))  # Maximum 8 workers
-    MODE = 'FULL'  # Mode FULL activé
+    # Bollinger Bands
+    BB_PERIODS = [10, 15, 20, 25, 30, 40, 50]
+    BB_STD_DEVS = [1.0, 1.5, 2.0, 2.5, 3.0]
+    BB_TYPES = ['TOUCH_LOWER', 'TOUCH_UPPER', 'BREAKOUT', 'REENTRY', 'SQUEEZE']
     
-    # Cache et optimisation
-    RATE_LIMIT_DELAY = 0.5  # Réduit pour accélérer
-    MAX_TRADES_MEMORY = 100000
-    USE_DISK_CACHE = True  # Cache disque activé
-    CACHE_DIR = Path.cwd() / 'data_cache'
+    # MACD
+    MACD_FAST = [8, 12, 16]
+    MACD_SLOW = [21, 26, 34]
+    MACD_SIGNAL = [7, 9, 13]
+    MACD_TYPES = ['CROSSOVER', 'ZERO_CROSS', 'DIVERGENCE']
     
+    # Volume
+    VOLUME_PERIODS = [5, 10, 20]
+    VOLUME_MULTIPLIERS = [1.5, 2.0, 3.0]
+    VOLUME_TYPES = ['SPIKE', 'DECLINE', 'DIVERGENCE']
+    
+    # Support/Résistance
+    SR_PERIODS = [20, 50, 100]
+    SR_TYPES = ['BOUNCE', 'BREAK', 'RETEST']
+    SR_CONFIRMATIONS = [1, 2, 3]
+    
+    # === FILTRES ===
+    VOLUME_FILTER_VALUES = [0.8, 1.0, 1.2, 1.5, 2.0]
+    TREND_FILTER_ADX = [20, 25, 30]
+    VOLATILITY_FILTER_ATR = [0.5, 1.0, 2.0]
+    
+    # === GESTION DU RISQUE ===
+    STOP_LOSS_TYPES = ['FIXED_PCT', 'ATR_MULTIPLE', 'SUPPORT', 'TRAILING']
+    STOP_LOSS_VALUES = [1.0, 2.0, 3.0, 5.0]
+    
+    TAKE_PROFIT_TYPES = ['FIXED_RR', 'MULTIPLE_TARGETS', 'DYNAMIC', 'RESISTANCE']
+    TAKE_PROFIT_VALUES = [1.5, 2.0, 3.0, 4.0]
+    
+    POSITION_SIZING_TYPES = ['FIXED_PCT', 'KELLY', 'VOLATILITY_ADJUSTED']
+    POSITION_SIZING_VALUES = [1.0, 2.0, 5.0]
+    
+    # === WALK-FORWARD ===
+    WF_FOLDS = 5
+    WF_TRAIN_RATIO = 0.7
+    WF_VALIDATION_TYPES = ['EXPANDING', 'ROLLING']
+    
+    # === OPTIMISATION ===
+    CPU_CORES = max(1, cpu_count() - 2)
+    CHUNK_SIZE = 10000
+    MAX_MEMORY_GB = 32
+    CACHE_ENABLED = True
+    
+    # === SORTIE ===
+    OUTPUT_FORMAT = 'parquet'
+    COMPRESSION = 'zstd'
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    OUTPUT_DIR = Path.cwd() / f'backtest_results_{timestamp}'
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR = Path.cwd() / f'backtest_dataset_{timestamp}'
     
-    @classmethod
-    def total_combinations(cls):
-        """Calcule le nombre total de combinaisons à tester"""
-        if cls.MODE == 'TEST':
-            return 39
-        else:
-            strategies = 0
-            # RSI combos
-            strategies += len(cls.RSI_BUY_RANGE)
-            # EMA combos (3 types)
-            strategies += len(cls.EMA_PERIODS) * 3
-            # BB combos (3 types)
-            strategies += len(cls.BB_PERIODS) * len(cls.BB_MULTIPLIERS) * 3
-            
-            risk_configs = 0
-            risk_configs += 1  # opposite_signal
-            risk_configs += len(cls.ATR_SL_MULTIPLIERS) * len(cls.ATR_TP_MULTIPLIERS)
-            risk_configs += len(cls.MAX_BARS_HOLD)
-            
-            return strategies * risk_configs
+    # === CONSTANTES ===
+    INITIAL_CAPITAL = 10000.0
+    COMMISSION_RATE = 0.001
+    SLIPPAGE_RATE = 0.001
+    MIN_DATA_POINTS = 1000
+    MIN_VOLUME = 1000
+    
+    def __post_init__(self):
+        self.OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ============================================================================
+# CLASSES DE DONNÉES
+# ============================================================================
 
 @dataclass
 class Trade:
-    trade_id: int
+    """Trade complet avec 50+ features de contexte"""
+    # Identifiant
+    trade_id: str
+    strategy_id: str
     ticker: str
     timeframe: str
-    entry_date: str
-    exit_date: str
+    
+    # Timing
+    entry_timestamp: str
+    exit_timestamp: str
+    duration_bars: int
+    duration_hours: float
+    
+    # Prix
     entry_price: float
     exit_price: float
-    sl_price: float
-    tp_price: float
+    stop_loss_price: float
+    take_profit_price: float
+    
+    # Position
     position_size: float
-    pnl_usd: float
-    pnl_pct: float
+    position_value_usd: float
+    
+    # P&L
+    pnl_absolute: float
+    pnl_percentage: float
+    pnl_commission: float
+    pnl_slippage: float
+    pnl_net: float
+    
+    # Sortie
     exit_reason: str
-    is_winner: bool
-    bars_held: int
-    volume_at_entry: float
-    atr_at_entry: float
-    strategy_type: str
-    strategy_params: Dict
-    total_cost: float
+    exit_type: str
+    
+    # Contexte technique
+    entry_rsi_14: float
+    entry_ema_20: float
+    entry_bb_width_pct: float
+    entry_adx: float
+    entry_atr: float
+    entry_atr_pct: float
+    entry_volume: float
+    entry_volume_ratio: float
+    
+    # Régime marché
+    market_regime: str
+    trend_strength: str
+    volatility_regime: str
+    volume_regime: str
+    
+    # Structure prix
+    distance_to_support_pct: float
+    distance_to_resistance_pct: float
+    price_position_in_range: float
+    is_swing_low: bool
+    is_swing_high: bool
+    
+    # Momentum
+    rsi_slope_5: float
+    macd_histogram: float
+    momentum_roc_10: float
+    candle_body_ratio: float
+    
+    # Contexte temporel
+    session: str
+    hour_of_day: int
+    day_of_week: int
+    month: int
+    quarter: int
+    is_weekend: bool
+    is_market_open: bool
+    
+    # Contexte global
+    vix_level: float = 0.0
+    btc_dominance: float = 0.0
+    fear_greed_index: float = 0.0
+    usd_index: float = 0.0
+    
+    # Métadonnées
+    data_quality_score: float = 1.0
+    liquidity_score: float = 1.0
+    spread_impact: float = 0.0
 
 @dataclass
 class StrategyMetrics:
-    ticker: str
-    timeframe: str
-    strategy_type: str
+    """Métriques brutes d'une stratégie - PAS DE SCORE COMPOSITE"""
+    # Identifiant
+    strategy_id: str
+    strategy_family: str
     strategy_params: Dict
     risk_params: Dict
+    filter_params: Dict
+    
+    ticker: str
+    timeframe: str
+    
+    # Performance brute
     total_trades: int
+    winning_trades: int
+    losing_trades: int
+    break_even_trades: int
+    
     win_rate: float
     profit_factor: float
+    expectancy: float
     total_return_pct: float
     total_return_usd: float
+    
+    # Risk metrics
     max_drawdown_pct: float
     max_drawdown_usd: float
+    max_drawdown_duration_days: int
     avg_drawdown_pct: float
-    avg_win_pct: float
-    avg_loss_pct: float
-    win_loss_ratio: float
-    avg_bars_held: float
     sharpe_ratio: float
     sortino_ratio: float
     calmar_ratio: float
+    ulcer_index: float
+    var_95: float
+    
+    # Trade statistics
+    avg_win_pct: float
+    avg_loss_pct: float
+    avg_trade_duration_hours: float
     max_consecutive_wins: int
     max_consecutive_losses: int
-    exit_sl_pct: float
-    exit_tp_pct: float
-    exit_time_pct: float
-    exit_signal_pct: float
-    total_commission: float
-    total_slippage: float
-    total_costs: float
-    composite_score: float
-    trades_per_month: float
-    avg_trade_duration_days: float
-    recovery_factor: float
-    stability_score: float
+    avg_bars_held: float
+    time_in_market_pct: float
+    
+    # Distribution
+    pnl_skewness: float
+    pnl_kurtosis: float
+    win_pnl_std: float
+    loss_pnl_std: float
+    
+    # Walk-forward (JSON sérialisé)
+    wf_results: str
+    wf_win_rate_stability: float
+    wf_profit_factor_stability: float
+    wf_degradation_score: float
+    
+    # Performance par régime (JSON sérialisé)
+    performance_by_regime: str
+    
+    # Sensibilités
+    volatility_sensitivity: float
+    trend_sensitivity: float
+    volume_sensitivity: float
+    time_sensitivity: float
+    liquidity_sensitivity: float
+    
+    # Métadonnées
+    data_points_used: int
+    data_quality: float
+    calculation_time_seconds: float
+    test_period_start: str
+    test_period_end: str
 
-class DataDownloader:
-    def __init__(self):
-        self.last_request = 0
+# ============================================================================
+# MOTEUR DE DONNÉES
+# ============================================================================
+
+class DataFetcher:
+    """Télécharge les données depuis Binance (crypto) et yfinance (actions)"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.binance = ccxt.binance({
+            'enableRateLimit': True,
+            'rateLimit': 1200,
+            'options': {'defaultType': 'spot'}
+        })
         self.cache = {}
-        if Config.USE_DISK_CACHE:
-            Config.CACHE_DIR.mkdir(exist_ok=True)
-    
-    def _rate_limit(self):
-        elapsed = time.time() - self.last_request
-        if elapsed < Config.RATE_LIMIT_DELAY:
-            time.sleep(Config.RATE_LIMIT_DELAY - elapsed)
-        self.last_request = time.time()
-    
-    def _get_cache_key(self, ticker: str, timeframe: str) -> str:
-        """Génère une clé de cache unique"""
-        return f"{ticker}_{timeframe}"
-    
-    def _get_disk_cache_path(self, cache_key: str) -> Path:
-        """Retourne le chemin du cache disque"""
-        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        return Config.CACHE_DIR / f"{cache_hash}.pkl"
-    
-    def _load_from_disk_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
-        """Charge depuis le cache disque"""
-        if not Config.USE_DISK_CACHE:
-            return None
         
-        cache_path = self._get_disk_cache_path(cache_key)
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'rb') as f:
-                    data = pickle.load(f)
-                    # Vérifier si le cache est récent (moins de 7 jours)
-                    if 'timestamp' in data:
-                        cache_age = datetime.now() - data['timestamp']
-                        if cache_age.days < 7:
-                            print(f"  💾 Loaded from cache: {cache_key}")
-                            return data['df']
-            except Exception:
-                pass
-        return None
-    
-    def _save_to_disk_cache(self, cache_key: str, df: pd.DataFrame):
-        """Sauvegarde dans le cache disque"""
-        if not Config.USE_DISK_CACHE:
-            return
+    def fetch_all_data(self) -> Dict[Tuple[str, str], pd.DataFrame]:
+        """Télécharge toutes les données"""
+        all_data = {}
         
-        try:
-            cache_path = self._get_disk_cache_path(cache_key)
-            cache_data = {
-                'df': df,
-                'timestamp': datetime.now(),
-                'key': cache_key
-            }
-            with open(cache_path, 'wb') as f:
-                pickle.dump(cache_data, f)
-        except Exception:
-            pass
-    
-    def fetch_single(self, ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
-        cache_key = self._get_cache_key(ticker, timeframe)
+        # Cryptos via Binance
+        print("📥 Téléchargement des données crypto...")
+        for ticker in self.config.CRYPTO_TICKERS:
+            for tf_name, tf_value in self.config.TIMEFRAMES.items():
+                data = self.fetch_binance_data(ticker, tf_value)
+                if data is not None and len(data) > self.config.MIN_DATA_POINTS:
+                    all_data[(ticker, tf_name)] = data
+                    print(f"  ✅ {ticker} {tf_name}: {len(data)} bougies")
         
-        # 1. Vérifier le cache mémoire
+        # Actions via yfinance
+        print("\n📥 Téléchargement des données actions...")
+        for ticker in self.config.STOCK_TICKERS:
+            for tf_name, tf_value in self.config.TIMEFRAMES.items():
+                data = self.fetch_yfinance_data(ticker, tf_value)
+                if data is not None and len(data) > self.config.MIN_DATA_POINTS:
+                    all_data[(ticker, tf_name)] = data
+                    print(f"  ✅ {ticker} {tf_name}: {len(data)} bougies")
+        
+        return all_data
+    
+    def fetch_binance_data(self, ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """Télécharge les données Binance avec pagination"""
+        cache_key = f"binance_{ticker}_{timeframe}"
         if cache_key in self.cache:
             return self.cache[cache_key]
         
-        # 2. Vérifier le cache disque
-        cached_df = self._load_from_disk_cache(cache_key)
-        if cached_df is not None:
-            self.cache[cache_key] = cached_df
-            return cached_df
+        try:
+            since = self.binance.parse8601(
+                (datetime.now() - timedelta(days=self.config.LOOKBACK_DAYS['D1']))
+                .strftime('%Y-%m-%dT%H:%M:%SZ')
+            )
+            
+            all_ohlcv = []
+            while True:
+                ohlcv = self.binance.fetch_ohlcv(
+                    ticker, 
+                    timeframe, 
+                    since=since,
+                    limit=1000
+                )
+                
+                if not ohlcv:
+                    break
+                
+                all_ohlcv.extend(ohlcv)
+                since = ohlcv[-1][0] + 1
+                
+                if len(ohlcv) < 1000:
+                    break
+                
+                time.sleep(self.binance.rateLimit / 1000)
+            
+            if not all_ohlcv:
+                return None
+            
+            df = pd.DataFrame(
+                all_ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            
+            # Nettoyage basique
+            df = df.replace(0, np.nan).ffill().bfill()
+            
+            self.cache[cache_key] = df
+            return df
+            
+        except Exception as e:
+            print(f"❌ Erreur Binance {ticker} {timeframe}: {e}")
+            return None
+    
+    def fetch_yfinance_data(self, ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """Télécharge les données yfinance"""
+        cache_key = f"yfinance_{ticker}_{timeframe}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
-        # 3. Télécharger depuis yfinance
-        yf_ticker = Config.CRYPTO_TICKERS.get(ticker, ticker)
-        yf_interval = Config.TIMEFRAMES[timeframe]
-        period = Config.LOOKBACK_PERIODS[timeframe]
-        
-        for attempt in range(3):
-            try:
-                self._rate_limit()
-                print(f"  📥 {yf_ticker} {timeframe}...", end=' ', flush=True)
-                
-                is_stock = ticker not in Config.CRYPTO_TICKERS
-                data = yf.download(yf_ticker, period=period, interval=yf_interval,
-                                 progress=False, auto_adjust=is_stock, threads=False)
-                
-                if data.empty:
-                    print("❌ Empty")
-                    continue
-                
-                if isinstance(data.columns, pd.MultiIndex):
-                    data.columns = data.columns.get_level_values(0)
-                
-                data.columns = [str(c).lower().strip() for c in data.columns]
-                required = ['open', 'high', 'low', 'close', 'volume']
-                if not all(col in data.columns for col in required):
-                    print(f"❌ Missing columns")
-                    continue
-                
-                data = data[required].copy()
-                
-                # Conversion en numérique
-                for col in data.columns:
-                    data[col] = pd.to_numeric(data[col], errors='coerce')
-                
-                data = data.replace([np.inf, -np.inf], np.nan)
-                data = data.dropna()
-                
-                min_bars = Config.MIN_BARS.get(timeframe, 500)
-                if len(data) < min_bars:
-                    print(f"❌ Insufficient ({len(data)} < {min_bars})")
-                    continue
-                
-                data['volume'] = data['volume'].replace(0, np.nan)
-                data['volume'] = data['volume'].fillna(data['volume'].median())
-                data['is_weekend'] = data.index.weekday >= 5
-                
-                print(f"✅ {len(data)} bars")
-                
-                # Sauvegarder dans les caches
-                self.cache[cache_key] = data
-                self._save_to_disk_cache(cache_key, data)
-                
-                return data
-                
-            except Exception as e:
-                print(f"❌ Error {attempt+1}/3: {str(e)[:50]}")
-                if attempt < 2:
-                    time.sleep(2)
-        
-        return None
+        try:
+            # Mapping timeframe
+            tf_mapping = {
+                '15m': '15m', '1h': '60m', '4h': '240m',
+                '1d': '1d', '1w': '1wk'
+            }
+            
+            period = f"{self.config.YEARS_OF_DATA}y"
+            interval = tf_mapping.get(timeframe, '1d')
+            
+            data = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=True
+            )
+            
+            if data.empty:
+                return None
+            
+            data.columns = [col.lower() for col in data.columns]
+            required = ['open', 'high', 'low', 'close', 'volume']
+            
+            if not all(col in data.columns for col in required):
+                return None
+            
+            df = data[required].copy()
+            df = df.replace(0, np.nan).ffill().bfill()
+            
+            self.cache[cache_key] = df
+            return df
+            
+        except Exception as e:
+            print(f"❌ Erreur yfinance {ticker} {timeframe}: {e}")
+            return None
 
-class Indicators:
-    @staticmethod
-    def safe_series(series: pd.Series) -> pd.Series:
-        return series.replace([np.inf, -np.inf], np.nan).fillna(0)
+# ============================================================================
+# INDICATEURS TECHNIQUES (VECTORISÉS)
+# ============================================================================
+
+class TechnicalIndicators:
+    """Calcul vectorisé de tous les indicateurs techniques"""
     
     @staticmethod
-    def rsi(data: pd.Series, period: int = 14) -> pd.Series:
-        delta = data.diff()
-        gain = delta.where(delta > 0, 0).rolling(period, min_periods=period).mean()
-        loss = -delta.where(delta < 0, 0).rolling(period, min_periods=period).mean()
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        """RSI vectorisé"""
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period, min_periods=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=period).mean()
+        
         rs = gain / loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
-        return Indicators.safe_series(rsi.fillna(50))
+        return rsi.fillna(50)
     
     @staticmethod
-    def ema(data: pd.Series, period: int) -> pd.Series:
-        if len(data) < period:
-            return pd.Series(data.iloc[-1] if len(data) > 0 else 0, index=data.index)
-        return data.ewm(span=period, adjust=False, min_periods=period).mean()
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        """EMA vectorisé"""
+        return series.ewm(span=period, adjust=False, min_periods=period).mean()
     
     @staticmethod
-    def bollinger_bands(data: pd.Series, period: int, std: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        if len(data) < period:
-            mid = pd.Series(data.iloc[-1] if len(data) > 0 else 0, index=data.index)
-            return mid, mid, mid
-        sma = data.rolling(period, min_periods=period).mean()
-        std_dev = data.rolling(period, min_periods=period).std()
+    def bollinger_bands(series: pd.Series, period: int, std: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """Bollinger Bands vectorisé"""
+        sma = series.rolling(window=period, min_periods=period).mean()
+        std_dev = series.rolling(window=period, min_periods=period).std()
+        
         upper = sma + (std_dev * std)
         lower = sma - (std_dev * std)
-        return (Indicators.safe_series(upper), Indicators.safe_series(sma), Indicators.safe_series(lower))
+        
+        return upper.fillna(method='bfill'), sma.fillna(method='bfill'), lower.fillna(method='bfill')
     
     @staticmethod
     def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        hl = df['high'] - df['low']
-        hc = (df['high'] - df['close'].shift()).abs()
-        lc = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        atr = tr.rolling(period, min_periods=period).mean()
-        return Indicators.safe_series(atr)
+        """ATR vectorisé"""
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(window=period, min_periods=period).mean()
+        return atr.fillna(method='bfill')
+    
+    @staticmethod
+    def adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """ADX vectorisé (Directional Movement Index)"""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        
+        # Plus Directional Movement (+DM)
+        up_move = high.diff()
+        down_move = low.diff().abs() * -1
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        
+        # Minus Directional Movement (-DM)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        # True Range
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        
+        # Smoothing
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / 
+                         tr.rolling(period).mean())
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / 
+                          tr.rolling(period).mean())
+        
+        # ADX
+        dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
+        adx = dx.rolling(period).mean()
+        
+        return adx.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+    
+    @staticmethod
+    def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """MACD vectorisé"""
+        ema_fast = series.ewm(span=fast, adjust=False).mean()
+        ema_slow = series.ewm(span=slow, adjust=False).mean()
+        
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        
+        return macd_line, signal_line, histogram
+    
+    @staticmethod
+    def stochastic(df: pd.DataFrame, period: int = 14, k_period: int = 3, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
+        """Stochastic Oscillator vectorisé"""
+        low_min = df['low'].rolling(window=period).min()
+        high_max = df['high'].rolling(window=period).max()
+        
+        k = 100 * ((df['close'] - low_min) / (high_max - low_min))
+        d = k.rolling(window=k_period).mean()
+        
+        return k.fillna(50), d.fillna(50)
 
-def generate_signals(df: pd.DataFrame, strategy_config: Dict) -> Tuple[pd.Series, pd.Series]:
-    buy = pd.Series(False, index=df.index)
-    sell = pd.Series(False, index=df.index)
-    strategy_type = strategy_config['type']
-    params = strategy_config['params']
-    
-    try:
-        if strategy_type == 'RSI_CROSS':
-            rsi_value = params['rsi_value']
-            rsi = Indicators.rsi(df['close'], 14)
-            buy = (rsi >= rsi_value) & (rsi.shift(1) < rsi_value)
-        
-        elif strategy_type == 'EMA_TOUCH':
-            period = params['ema_period']
-            if len(df) >= period:
-                ema = Indicators.ema(df['close'], period)
-                buy = (df['low'] <= ema) & (df['close'] > ema)
-        
-        elif strategy_type == 'EMA_CROSSOVER':
-            period = params['ema_period']
-            if len(df) >= period:
-                ema = Indicators.ema(df['close'], period)
-                buy = (df['close'] > ema) & (df['close'].shift(1) <= ema.shift(1))
-        
-        elif strategy_type == 'EMA_REVERSION':
-            period = params['ema_period']
-            if len(df) >= period:
-                ema = Indicators.ema(df['close'], period)
-                deviation = ((df['close'] - ema) / ema * 100).abs()
-                buy = deviation > 2.0
-        
-        elif strategy_type == 'BB_TOUCH':
-            period = params['bb_period']
-            mult = params['bb_multiplier']
-            if len(df) >= period:
-                upper, mid, lower = Indicators.bollinger_bands(df['close'], period, mult)
-                buy = (df['low'] <= lower) & (df['close'] > lower)
-        
-        elif strategy_type == 'BB_BREAKOUT':
-            period = params['bb_period']
-            mult = params['bb_multiplier']
-            if len(df) >= period:
-                upper, mid, lower = Indicators.bollinger_bands(df['close'], period, mult)
-                buy = df['close'] < lower
-                sell = df['close'] > upper
-        
-        elif strategy_type == 'BB_REENTRY':
-            period = params['bb_period']
-            mult = params['bb_multiplier']
-            if len(df) >= period:
-                upper, mid, lower = Indicators.bollinger_bands(df['close'], period, mult)
-                was_outside = (df['close'].shift(1) > upper.shift(1)) | (df['close'].shift(1) < lower.shift(1))
-                is_inside = (df['close'] <= upper) & (df['close'] >= lower)
-                buy = was_outside & is_inside
-    except Exception:
-        pass
-    
-    return buy.fillna(False), sell.fillna(False)
+# ============================================================================
+# CACHE D'INDICATEURS
+# ============================================================================
 
-def run_backtest(ticker: str, timeframe: str, df: pd.DataFrame, strategy_config: Dict, risk_config: Dict) -> Tuple[List[Trade], List[float]]:
-    trades = []
-    capital = Config.INITIAL_CAPITAL
-    equity_curve = [capital]
-    position = None
-    in_position = False
-    trade_id = 0
+class IndicatorsCache:
+    """Cache hiérarchique pour tous les indicateurs"""
     
-    commission_rate = Config.COMMISSIONS.get(timeframe, 0.001)
-    slippage_rate = Config.SLIPPAGE.get(timeframe, 0.001)
-    atr_series = Indicators.atr(df, 14)
-    volume_sma = df['volume'].rolling(20, min_periods=10).mean()
-    buy_signals_raw, sell_signals_raw = generate_signals(df, strategy_config)
-    
-    # Convertir en arrays numpy pour performance
-    opens = df['open'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
-    volumes = df['volume'].values
-    dates = df.index
-    atr_values = atr_series.values
-    buy_arr = buy_signals_raw.values
-    sell_arr = sell_signals_raw.values
-    
-    start_idx = max(Config.WARMUP_BARS, 200)
-    
-    for i in range(start_idx, len(df)):
-        if capital <= 0:
-            equity_curve.append(0)
-            break
+    def __init__(self, config: Config):
+        self.config = config
+        self.cache = {}
+        self.memory_cache = {}
         
-        if in_position and position:
-            sl_effective = position['sl'] * (1 - slippage_rate)
-            tp_effective = position['tp'] * (1 + slippage_rate)
-            exit_triggered = False
-            exit_price = 0
-            exit_reason = "UNKNOWN"
-            
-            if lows[i] <= sl_effective:
-                exit_price = sl_effective
-                exit_reason = "SL"
-                exit_triggered = True
-            elif highs[i] >= tp_effective:
-                exit_price = tp_effective
-                exit_reason = "TP"
-                exit_triggered = True
-            elif risk_config['exit_type'] == 'time_based':
-                bars_held = i - position['entry_idx']
-                if bars_held >= position['max_bars']:
-                    exit_price = opens[i] * (1 - slippage_rate)
-                    exit_reason = "TIME"
-                    exit_triggered = True
-            elif risk_config['exit_type'] == 'opposite_signal':
-                if i > 0 and sell_arr[i-1]:
-                    exit_price = opens[i] * (1 - slippage_rate)
-                    exit_reason = "SIGNAL"
-                    exit_triggered = True
-            
-            if exit_triggered:
-                entry_final = position['entry_price']
-                gross_pnl = (exit_price - entry_final) * position['size']
-                commission = (entry_final + exit_price) * position['size'] * commission_rate
-                net_pnl = gross_pnl - commission
-                capital += net_pnl
-                slippage_cost = (entry_final * slippage_rate + exit_price * slippage_rate) * position['size']
-                total_cost = commission + slippage_cost
-                
-                trade = Trade(trade_id=trade_id, ticker=ticker, timeframe=timeframe,
-                            entry_date=str(position['entry_date']), exit_date=str(dates[i]),
-                            entry_price=entry_final, exit_price=exit_price,
-                            sl_price=position['sl'], tp_price=position['tp'],
-                            position_size=position['size'], pnl_usd=round(net_pnl, 2),
-                            pnl_pct=round((net_pnl / (entry_final * position['size'])) * 100, 2),
-                            exit_reason=exit_reason, is_winner=net_pnl > 0,
-                            bars_held=i - position['entry_idx'], volume_at_entry=position['volume'],
-                            atr_at_entry=position['atr'], strategy_type=strategy_config['type'],
-                            strategy_params=strategy_config['params'], total_cost=round(total_cost, 2))
-                
-                trades.append(trade)
-                trade_id += 1
-                in_position = False
-                position = None
+    def precompute_for_data(self, df: pd.DataFrame, ticker: str, timeframe: str):
+        """Pré-calculer tous les indicateurs pour un dataframe"""
+        cache_key = f"{ticker}_{timeframe}"
         
-        if not in_position:
-            if i > 0 and buy_arr[i-1]:
-                vol_threshold = volume_sma.iloc[i] * Config.MIN_VOLUME_RATIO
-                if pd.notna(vol_threshold) and volumes[i] < vol_threshold:
-                    equity_curve.append(capital)
-                    continue
-                
-                atr_val = atr_values[i]
-                if pd.isna(atr_val) or atr_val <= 0:
-                    equity_curve.append(capital)
-                    continue
-                
-                entry_price = closes[i] * (1 + slippage_rate)
-                
-                if risk_config['exit_type'] == 'atr_fixed':
-                    sl_mult = risk_config.get('sl_multiplier', 2.0)
-                    tp_mult = risk_config.get('tp_multiplier', 3.0)
-                    sl = entry_price - (atr_val * sl_mult)
-                    tp = entry_price + (atr_val * tp_mult)
-                    max_bars = 999999
-                elif risk_config['exit_type'] == 'time_based':
-                    sl = entry_price * 0.95
-                    tp = entry_price * 1.10
-                    max_bars = risk_config.get('max_bars', 20)
-                else:
-                    sl = entry_price * 0.98
-                    tp = entry_price * 1.05
-                    max_bars = 999999
-                
-                if sl <= 0 or tp <= entry_price or sl >= entry_price:
-                    equity_curve.append(capital)
-                    continue
-                
-                risk_per_share = entry_price - sl
-                if risk_per_share <= 0:
-                    equity_curve.append(capital)
-                    continue
-                
-                risk_amount = capital * Config.RISK_PER_TRADE
-                size = risk_amount / risk_per_share
-                max_size = (capital * Config.MAX_POSITION_PCT) / entry_price
-                size = min(size, max_size)
-                
-                if size <= 0 or size * entry_price > capital:
-                    equity_curve.append(capital)
-                    continue
-                
-                position = {'entry_idx': i, 'entry_date': dates[i], 'entry_price': entry_price,
-                          'sl': sl, 'tp': tp, 'size': size, 'volume': volumes[i],
-                          'atr': atr_val, 'max_bars': max_bars}
-                in_position = True
+        if cache_key in self.memory_cache:
+            return self.memory_cache[cache_key]
         
-        current_equity = capital
-        if in_position and position:
-            unrealized = (closes[i] - position['entry_price']) * position['size']
-            current_equity = capital + unrealized
-        equity_curve.append(current_equity)
+        indicators = {}
+        
+        # RSI pour toutes périodes
+        for period in self.config.RSI_PERIODS:
+            key = f"rsi_{period}"
+            indicators[key] = TechnicalIndicators.rsi(df['close'], period)
+        
+        # EMA pour périodes principales
+        for period in [5, 10, 20, 50, 100, 200]:
+            key = f"ema_{period}"
+            indicators[key] = TechnicalIndicators.ema(df['close'], period)
+        
+        # Bollinger Bands pour combinaisons principales
+        for period in [20, 50]:
+            for std in [1.5, 2.0, 2.5]:
+                key = f"bb_{period}_{std}"
+                upper, middle, lower = TechnicalIndicators.bollinger_bands(df['close'], period, std)
+                indicators[f"{key}_upper"] = upper
+                indicators[f"{key}_middle"] = middle
+                indicators[f"{key}_lower"] = lower
+        
+        # ATR
+        indicators['atr_14'] = TechnicalIndicators.atr(df, 14)
+        
+        # ADX
+        adx, plus_di, minus_di = TechnicalIndicators.adx(df, 14)
+        indicators['adx_14'] = adx
+        indicators['plus_di_14'] = plus_di
+        indicators['minus_di_14'] = minus_di
+        
+        # Volume
+        indicators['volume_sma_20'] = df['volume'].rolling(20).mean()
+        indicators['volume_ratio'] = df['volume'] / indicators['volume_sma_20']
+        
+        self.memory_cache[cache_key] = indicators
+        return indicators
     
-    return trades, equity_curve
-
-def calculate_metrics(ticker: str, timeframe: str, trades: List[Trade], equity_curve: List[float],
-                     strategy_config: Dict, risk_config: Dict) -> Optional[StrategyMetrics]:
-    if not trades or len(trades) < Config.MIN_TRADES:
-        return None
-    
-    winners = [t for t in trades if t.is_winner]
-    losers = [t for t in trades if not t.is_winner]
-    total = len(trades)
-    win_rate = (len(winners) / total * 100) if total > 0 else 0
-    total_wins = sum(t.pnl_usd for t in winners) if winners else 0
-    total_losses = abs(sum(t.pnl_usd for t in losers)) if losers else 0.01
-    profit_factor = total_wins / total_losses if total_losses > 0 else 0
-    
-    final = equity_curve[-1]
-    total_return_usd = final - Config.INITIAL_CAPITAL
-    total_return_pct = (total_return_usd / Config.INITIAL_CAPITAL) * 100
-    avg_win = (sum(t.pnl_pct for t in winners) / len(winners)) if winners else 0
-    avg_loss = (sum(t.pnl_pct for t in losers) / len(losers)) if losers else 0
-    win_loss_ratio = (avg_win / abs(avg_loss)) if avg_loss != 0 else 0
-    
-    peak = Config.INITIAL_CAPITAL
-    max_dd_pct = 0
-    max_dd_usd = 0
-    drawdowns = []
-    for equity in equity_curve:
-        if equity > peak:
-            peak = equity
-        dd_usd = peak - equity
-        dd_pct = (dd_usd / peak * 100) if peak > 0 else 0
-        drawdowns.append(dd_pct)
-        if dd_pct > max_dd_pct:
-            max_dd_pct = dd_pct
-            max_dd_usd = dd_usd
-    
-    avg_dd = np.mean([d for d in drawdowns if d > 0]) if any(d > 0 for d in drawdowns) else 0
-    recovery = abs(total_return_pct / max_dd_pct) if max_dd_pct > 0 else 0
-    
-    consec_wins = 0
-    consec_losses = 0
-    max_consec_wins = 0
-    max_consec_losses = 0
-    for trade in trades:
-        if trade.is_winner:
-            consec_wins += 1
-            consec_losses = 0
-            max_consec_wins = max(max_consec_wins, consec_wins)
+    def get_indicator(self, df: pd.DataFrame, ticker: str, timeframe: str, indicator: str, **params):
+        """Récupérer un indicateur depuis le cache ou le calculer"""
+        cache_key = f"{ticker}_{timeframe}_{indicator}_{'_'.join(map(str, params.values()))}"
+        
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        if indicator == 'rsi':
+            result = TechnicalIndicators.rsi(df['close'], params.get('period', 14))
+        elif indicator == 'ema':
+            result = TechnicalIndicators.ema(df['close'], params['period'])
+        elif indicator == 'bb':
+            result = TechnicalIndicators.bollinger_bands(df['close'], params['period'], params['std'])
+        elif indicator == 'atr':
+            result = TechnicalIndicators.atr(df, params.get('period', 14))
+        elif indicator == 'adx':
+            result = TechnicalIndicators.adx(df, params.get('period', 14))
+        elif indicator == 'macd':
+            result = TechnicalIndicators.macd(
+                df['close'], 
+                params.get('fast', 12), 
+                params.get('slow', 26), 
+                params.get('signal', 9)
+            )
         else:
-            consec_losses += 1
-            consec_wins = 0
-            max_consec_losses = max(max_consec_losses, consec_losses)
-    
-    returns = pd.Series(equity_curve).pct_change().dropna()
-    bars_per_year = {'H1': 252*6.5, 'H4': 252*1.625, 'D1': 252, 'W1': 52}
-    annual_factor = bars_per_year.get(timeframe, 252)
-    
-    sharpe = 0
-    if len(returns) > 0 and returns.std() != 0:
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(annual_factor)
-    
-    sortino = 0
-    downside = returns[returns < 0]
-    if len(downside) > 0 and downside.std() != 0:
-        sortino = (returns.mean() / downside.std()) * np.sqrt(annual_factor)
-    
-    calmar = (total_return_pct / max_dd_pct) if max_dd_pct > 0 else 0
-    
-    exit_counts = {}
-    for t in trades:
-        exit_counts[t.exit_reason] = exit_counts.get(t.exit_reason, 0) + 1
-    exit_sl = (exit_counts.get('SL', 0) / total * 100)
-    exit_tp = (exit_counts.get('TP', 0) / total * 100)
-    exit_time = (exit_counts.get('TIME', 0) / total * 100)
-    exit_signal = (exit_counts.get('SIGNAL', 0) / total * 100)
-    
-    total_commission = sum(t.total_cost for t in trades)
-    total_slippage = total_commission * 0.5
-    total_costs = total_commission + total_slippage
-    
-    pf_norm = min(profit_factor / 3.0, 1.0)
-    dd_norm = max(1 - (max_dd_pct / 100), 0)
-    wr_norm = win_rate / 100
-    trades_norm = min(np.log10(total + 1) / 3.0, 1.0)
-    composite = pf_norm * dd_norm * wr_norm * trades_norm * 100
-    
-    duration_days = (pd.to_datetime(trades[-1].exit_date) - pd.to_datetime(trades[0].entry_date)).days
-    trades_per_month = (total / max(duration_days / 30, 1)) if duration_days > 0 else 0
-    avg_duration = np.mean([t.bars_held for t in trades])
-    bars_to_days = {'H1': 1/6.5, 'H4': 1/1.625, 'D1': 1, 'W1': 7}
-    avg_trade_days = avg_duration * bars_to_days.get(timeframe, 1)
-    stability = 1 / (1 + returns.std()) if len(returns) > 0 and returns.std() > 0 else 0
-    
-    return StrategyMetrics(ticker=ticker, timeframe=timeframe, strategy_type=strategy_config['type'],
-                          strategy_params=strategy_config['params'], risk_params=risk_config,
-                          total_trades=total, win_rate=round(win_rate, 2), profit_factor=round(profit_factor, 2),
-                          total_return_pct=round(total_return_pct, 2), total_return_usd=round(total_return_usd, 2),
-                          max_drawdown_pct=round(max_dd_pct, 2), max_drawdown_usd=round(max_dd_usd, 2),
-                          avg_drawdown_pct=round(avg_dd, 2), avg_win_pct=round(avg_win, 2),
-                          avg_loss_pct=round(avg_loss, 2), win_loss_ratio=round(win_loss_ratio, 2),
-                          avg_bars_held=round(avg_duration, 1), sharpe_ratio=round(sharpe, 2),
-                          sortino_ratio=round(sortino, 2), calmar_ratio=round(calmar, 2),
-                          max_consecutive_wins=max_consec_wins, max_consecutive_losses=max_consec_losses,
-                          exit_sl_pct=round(exit_sl, 1), exit_tp_pct=round(exit_tp, 1),
-                          exit_time_pct=round(exit_time, 1), exit_signal_pct=round(exit_signal, 1),
-                          total_commission=round(total_commission, 2), total_slippage=round(total_slippage, 2),
-                          total_costs=round(total_costs, 2), composite_score=round(composite, 2),
-                          trades_per_month=round(trades_per_month, 2), avg_trade_duration_days=round(avg_trade_days, 1),
-                          recovery_factor=round(recovery, 2), stability_score=round(stability, 3))
+            raise ValueError(f"Indicateur non supporté: {indicator}")
+        
+        self.cache[cache_key] = result
+        return result
 
-def generate_combinations() -> List[Tuple[Dict, Dict]]:
-    strategies = []
-    risk_configs = []
-    
-    if Config.MODE == 'TEST':
-        for rsi_val in [25, 30, 35]:
-            strategies.append({'type': 'RSI_CROSS', 'params': {'rsi_value': rsi_val}})
-        for period in [20, 50, 100]:
-            for ema_type in ['TOUCH', 'CROSSOVER']:
-                strategies.append({'type': f'EMA_{ema_type}', 'params': {'ema_period': period}})
-        for period in [20]:
-            for mult in [2.0, 2.5]:
-                for bb_type in ['TOUCH', 'BREAKOUT']:
-                    strategies.append({'type': f'BB_{bb_type}', 'params': {'bb_period': period, 'bb_multiplier': mult}})
-        risk_configs = [{'exit_type': 'opposite_signal'},
-                       {'exit_type': 'atr_fixed', 'sl_multiplier': 2.0, 'tp_multiplier': 3.0},
-                       {'exit_type': 'time_based', 'max_bars': 20}]
-    else:
-        # FULL MODE - paramètres complets mais optimisés
-        for rsi_val in Config.RSI_BUY_RANGE:
-            strategies.append({'type': 'RSI_CROSS', 'params': {'rsi_value': rsi_val}})
-        
-        for period in Config.EMA_PERIODS:
-            for ema_type in ['TOUCH', 'CROSSOVER', 'REVERSION']:
-                strategies.append({'type': f'EMA_{ema_type}', 'params': {'ema_period': period}})
-        
-        for period in Config.BB_PERIODS:
-            for mult in Config.BB_MULTIPLIERS:
-                for bb_type in ['TOUCH', 'BREAKOUT', 'REENTRY']:
-                    strategies.append({'type': f'BB_{bb_type}', 'params': {'bb_period': period, 'bb_multiplier': mult}})
-        
-        risk_configs.append({'exit_type': 'opposite_signal'})
-        
-        for sl in Config.ATR_SL_MULTIPLIERS:
-            for tp in Config.ATR_TP_MULTIPLIERS:
-                if tp > sl:
-                    risk_configs.append({'exit_type': 'atr_fixed', 'sl_multiplier': sl, 'tp_multiplier': tp})
-        
-        for max_bars in Config.MAX_BARS_HOLD:
-            risk_configs.append({'exit_type': 'time_based', 'max_bars': max_bars})
-    
-    combos = []
-    for strat in strategies:
-        for risk in risk_configs:
-            combos.append((strat, risk))
-    
-    print(f"  📊 Generated {len(combos)} strategy/risk combinations")
-    return combos
+# ============================================================================
+# CONTEXTE DE MARCHÉ
+# ============================================================================
 
-def backtest_worker(args):
-    """Worker function for multiprocessing"""
-    try:
-        ticker, timeframe, strategy_config, risk_config, df_data = args
+class MarketContext:
+    """Calcule le contexte de marché pour chaque bougie"""
+    
+    @staticmethod
+    def calculate_market_regime(df: pd.DataFrame, indicators: Dict) -> pd.Series:
+        """Détermine le régime de marché"""
+        adx = indicators.get('adx_14', pd.Series(0, index=df.index))
+        atr = indicators.get('atr_14', pd.Series(0, index=df.index))
         
-        # Reconstruire le DataFrame
-        df = pd.DataFrame(
-            data=df_data['data'],
-            index=pd.to_datetime(df_data['index']),
-            columns=df_data['columns']
+        # Seuils
+        adx_threshold = 25
+        atr_median = atr.rolling(100).median()
+        
+        conditions = []
+        regimes = []
+        
+        for i in range(len(df)):
+            if i < 100:
+                regimes.append('UNKNOWN')
+                continue
+            
+            adx_val = adx.iloc[i] if i < len(adx) else 0
+            atr_val = atr.iloc[i] if i < len(atr) else 0
+            atr_med = atr_median.iloc[i]
+            
+            # Détermination du régime
+            if adx_val > adx_threshold:
+                if atr_val > atr_med * 1.5:
+                    regime = 'TRENDING_HIGH_VOL'
+                else:
+                    regime = 'TRENDING_NORMAL_VOL'
+            else:
+                if atr_val > atr_med * 1.5:
+                    regime = 'RANGING_HIGH_VOL'
+                else:
+                    regime = 'RANGING_NORMAL_VOL'
+            
+            regimes.append(regime)
+        
+        return pd.Series(regimes, index=df.index)
+    
+    @staticmethod
+    def calculate_support_resistance(df: pd.DataFrame, lookback: int = 100) -> Tuple[pd.Series, pd.Series]:
+        """Calcule les niveaux de support et résistance"""
+        supports = pd.Series(np.nan, index=df.index)
+        resistances = pd.Series(np.nan, index=df.index)
+        
+        for i in range(lookback, len(df)):
+            window = df['low'].iloc[i-lookback:i]
+            supports.iloc[i] = window.min()
+            
+            window = df['high'].iloc[i-lookback:i]
+            resistances.iloc[i] = window.max()
+        
+        return supports.ffill(), resistances.ffill()
+    
+    @staticmethod
+    def calculate_session(timestamp: pd.Timestamp) -> str:
+        """Détermine la session de trading"""
+        hour = timestamp.hour
+        
+        if 0 <= hour < 8:
+            return 'ASIA'
+        elif 8 <= hour < 16:
+            return 'LONDON'
+        elif 16 <= hour < 24:
+            return 'NY'
+        else:
+            return 'GLOBAL'
+
+# ============================================================================
+# GÉNÉRATEUR DE STRATÉGIES BRUTE FORCE
+# ============================================================================
+
+class StrategyGenerator:
+    """Génère toutes les combinaisons de stratégies brute force"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.strategies = []
+    
+    def generate_all_strategies(self):
+        """Génère toutes les stratégies à tester"""
+        print("🧠 Génération des stratégies brute force...")
+        
+        # RSI brute force
+        rsi_strategies = self._generate_rsi_strategies()
+        print(f"  RSI: {len(rsi_strategies)} combinaisons")
+        
+        # EMA brute force
+        ema_strategies = self._generate_ema_strategies()
+        print(f"  EMA: {len(ema_strategies)} combinaisons")
+        
+        # Bollinger Bands brute force
+        bb_strategies = self._generate_bb_strategies()
+        print(f"  BB: {len(bb_strategies)} combinaisons")
+        
+        # MACD brute force
+        macd_strategies = self._generate_macd_strategies()
+        print(f"  MACD: {len(macd_strategies)} combinaisons")
+        
+        self.strategies = rsi_strategies + ema_strategies + bb_strategies + macd_strategies
+        print(f"🎯 Total: {len(self.strategies)} stratégies")
+        
+        return self.strategies
+    
+    def _generate_rsi_strategies(self) -> List[Dict]:
+        """Génère toutes les combinaisons RSI"""
+        strategies = []
+        
+        for period in self.config.RSI_PERIODS:
+            for buy_thresh in self.config.RSI_BUY_VALUES:
+                for sell_thresh in self.config.RSI_SELL_VALUES:
+                    if buy_thresh >= sell_thresh:
+                        continue
+                    
+                    for signal_type in self.config.RSI_SIGNAL_TYPES:
+                        strategy = {
+                            'family': 'RSI',
+                            'params': {
+                                'period': period,
+                                'buy_threshold': buy_thresh,
+                                'sell_threshold': sell_thresh,
+                                'signal_type': signal_type
+                            }
+                        }
+                        strategies.append(strategy)
+        
+        return strategies
+    
+    def _generate_ema_strategies(self) -> List[Dict]:
+        """Génère toutes les combinaisons EMA"""
+        strategies = []
+        
+        for ema_type in self.config.EMA_TYPES:
+            if ema_type == 'FAST_SLOW_CROSS':
+                for fast, slow in self.config.EMA_FAST_SLOW_COMBOS:
+                    strategy = {
+                        'family': 'EMA',
+                        'params': {
+                            'type': ema_type,
+                            'fast_period': fast,
+                            'slow_period': slow
+                        }
+                    }
+                    strategies.append(strategy)
+            else:
+                for period in self.config.EMA_PERIODS[:20]:  # Limité à 20 pour performance
+                    strategy = {
+                        'family': 'EMA',
+                        'params': {
+                            'type': ema_type,
+                            'period': period
+                        }
+                    }
+                    strategies.append(strategy)
+        
+        return strategies
+    
+    def _generate_bb_strategies(self) -> List[Dict]:
+        """Génère toutes les combinaisons Bollinger Bands"""
+        strategies = []
+        
+        for period in self.config.BB_PERIODS:
+            for std in self.config.BB_STD_DEVS:
+                for bb_type in self.config.BB_TYPES:
+                    strategy = {
+                        'family': 'BB',
+                        'params': {
+                            'period': period,
+                            'std_dev': std,
+                            'type': bb_type
+                        }
+                    }
+                    strategies.append(strategy)
+        
+        return strategies
+    
+    def _generate_macd_strategies(self) -> List[Dict]:
+        """Génère toutes les combinaisons MACD"""
+        strategies = []
+        
+        for fast in self.config.MACD_FAST:
+            for slow in self.config.MACD_SLOW:
+                if fast >= slow:
+                    continue
+                for signal in self.config.MACD_SIGNAL:
+                    for macd_type in self.config.MACD_TYPES:
+                        strategy = {
+                            'family': 'MACD',
+                            'params': {
+                                'fast': fast,
+                                'slow': slow,
+                                'signal': signal,
+                                'type': macd_type
+                            }
+                        }
+                        strategies.append(strategy)
+        
+        return strategies
+
+# ============================================================================
+# FILTRES
+# ============================================================================
+
+class VolumeFilter:
+    """Filtre basé sur le volume"""
+    
+    def __init__(self, multiplier: float = 1.0):
+        self.multiplier = multiplier
+    
+    def apply(self, df: pd.DataFrame, signals: pd.Series) -> pd.Series:
+        """Applique le filtre volume"""
+        volume_sma = df['volume'].rolling(20).mean()
+        filtered = signals.copy()
+        filtered[df['volume'] < (volume_sma * self.multiplier)] = False
+        return filtered
+
+class TrendFilter:
+    """Filtre basé sur la tendance"""
+    
+    def __init__(self, adx_threshold: float = 25):
+        self.adx_threshold = adx_threshold
+    
+    def apply(self, df: pd.DataFrame, signals: pd.Series, adx: pd.Series) -> pd.Series:
+        """Applique le filtre tendance"""
+        filtered = signals.copy()
+        filtered[adx < self.adx_threshold] = False
+        return filtered
+
+class VolatilityFilter:
+    """Filtre basé sur la volatilité"""
+    
+    def __init__(self, atr_multiplier: float = 1.0):
+        self.atr_multiplier = atr_multiplier
+    
+    def apply(self, df: pd.DataFrame, signals: pd.Series, atr: pd.Series) -> pd.Series:
+        """Applique le filtre volatilité"""
+        atr_median = atr.rolling(100).median()
+        filtered = signals.copy()
+        filtered[atr > (atr_median * self.atr_multiplier)] = False
+        return filtered
+
+# ============================================================================
+# GESTION DU RISQUE
+# ============================================================================
+
+class RiskManager:
+    """Gestion du risque adaptative"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+    
+    def calculate_stop_loss(self, df: pd.DataFrame, entry_idx: int, 
+                           entry_price: float, sl_type: str, 
+                           sl_value: float, atr: pd.Series) -> float:
+        """Calcule le stop-loss"""
+        if sl_type == 'FIXED_PCT':
+            return entry_price * (1 - sl_value / 100)
+        elif sl_type == 'ATR_MULTIPLE':
+            atr_val = atr.iloc[entry_idx] if entry_idx < len(atr) else 0
+            return entry_price - (atr_val * sl_value)
+        elif sl_type == 'SUPPORT':
+            # Cherche le support le plus proche
+            lookback = 50
+            start = max(0, entry_idx - lookback)
+            support = df['low'].iloc[start:entry_idx].min()
+            return support * 0.99
+        else:  # TRAILING
+            return entry_price * 0.95
+    
+    def calculate_take_profit(self, entry_price: float, sl_price: float, 
+                             tp_type: str, tp_value: float) -> float:
+        """Calcule le take-profit"""
+        risk = entry_price - sl_price
+        
+        if tp_type == 'FIXED_RR':
+            return entry_price + (risk * tp_value)
+        elif tp_type == 'MULTIPLE_TARGETS':
+            return entry_price * (1 + tp_value / 100)
+        elif tp_type == 'DYNAMIC':
+            return entry_price * 1.03
+        else:  # RESISTANCE
+            return entry_price * 1.05
+    
+    def calculate_position_size(self, capital: float, entry_price: float, 
+                               sl_price: float, sizing_type: str, 
+                               sizing_value: float) -> float:
+        """Calcule la taille de position"""
+        risk_per_share = entry_price - sl_price
+        
+        if sizing_type == 'FIXED_PCT':
+            risk_amount = capital * (sizing_value / 100)
+        elif sizing_type == 'KELLY':
+            # Simplifié - à améliorer
+            risk_amount = capital * 0.02
+        else:  # VOLATILITY_ADJUSTED
+            risk_amount = capital * 0.02
+        
+        if risk_per_share <= 0:
+            return 0
+        
+        size = risk_amount / risk_per_share
+        max_size = (capital * 0.15) / entry_price  # 15% max
+        
+        return min(size, max_size)
+
+# ============================================================================
+# MOTEUR DE BACKTEST VECTORISÉ
+# ============================================================================
+
+class VectorizedBacktestEngine:
+    """Moteur de backtest vectorisé pour performance optimale"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.risk_manager = RiskManager(config)
+    
+    def run_backtest(self, df: pd.DataFrame, strategy: Dict, 
+                    indicators: Dict, ticker: str, timeframe: str) -> Tuple[List[Trade], pd.Series]:
+        """Exécute un backtest vectorisé"""
+        
+        # Générer les signaux
+        signals = self._generate_signals(df, strategy, indicators)
+        
+        if signals.empty:
+            return [], pd.Series()
+        
+        # Vectoriser les données
+        opens = df['open'].values
+        closes = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        volumes = df['volume'].values
+        dates = df.index
+        
+        # Configuration risque (fixe pour cette version)
+        sl_type = 'FIXED_PCT'
+        sl_value = 2.0
+        tp_type = 'FIXED_RR'
+        tp_value = 3.0
+        sizing_type = 'FIXED_PCT'
+        sizing_value = 2.0
+        
+        # Initialisation
+        capital = self.config.INITIAL_CAPITAL
+        trades = []
+        equity_curve = [capital]
+        position = None
+        trade_id = 0
+        
+        atr = indicators.get('atr_14', pd.Series(0, index=df.index)).values
+        adx = indicators.get('adx_14', pd.Series(0, index=df.index)).values
+        
+        for i in range(50, len(df)):  # Warmup period
+            if capital <= 0:
+                break
+            
+            # Gestion position ouverte
+            if position is not None:
+                sl_price = position['sl']
+                tp_price = position['tp']
+                entry_idx = position['entry_idx']
+                
+                # Vérifier sorties
+                exit_idx = None
+                exit_price = 0
+                exit_reason = ""
+                
+                # SL hit
+                if lows[i] <= sl_price:
+                    exit_idx = i
+                    exit_price = sl_price
+                    exit_reason = "SL"
+                # TP hit
+                elif highs[i] >= tp_price:
+                    exit_idx = i
+                    exit_price = tp_price
+                    exit_reason = "TP"
+                # Time-based exit (50 bars max)
+                elif (i - entry_idx) >= 50:
+                    exit_idx = i
+                    exit_price = opens[i]
+                    exit_reason = "TIME"
+                
+                if exit_idx is not None:
+                    # Calcul P&L
+                    entry_price = position['entry_price']
+                    position_size = position['size']
+                    
+                    gross_pnl = (exit_price - entry_price) * position_size
+                    commission = (entry_price + exit_price) * position_size * self.config.COMMISSION_RATE
+                    slippage = (entry_price + exit_price) * position_size * self.config.SLIPPAGE_RATE
+                    net_pnl = gross_pnl - commission - slippage
+                    
+                    capital += net_pnl
+                    
+                    # Créer le trade
+                    trade = self._create_trade(
+                        trade_id=trade_id,
+                        ticker=ticker,
+                        timeframe=timeframe,
+                        entry_idx=entry_idx,
+                        exit_idx=exit_idx,
+                        entry_price=entry_price,
+                        exit_price=exit_price,
+                        position_size=position_size,
+                        pnl_net=net_pnl,
+                        exit_reason=exit_reason,
+                        df=df,
+                        indicators=indicators,
+                        strategy=strategy
+                    )
+                    
+                    trades.append(trade)
+                    trade_id += 1
+                    position = None
+            
+            # Ouverture nouvelle position
+            if position is None and i > 0 and signals.iloc[i-1]:
+                entry_price = closes[i]
+                
+                # Calcul SL/TP
+                sl_price = self.risk_manager.calculate_stop_loss(
+                    df, i, entry_price, sl_type, sl_value, 
+                    pd.Series(atr, index=df.index)
+                )
+                
+                tp_price = self.risk_manager.calculate_take_profit(
+                    entry_price, sl_price, tp_type, tp_value
+                )
+                
+                # Calcul taille position
+                position_size = self.risk_manager.calculate_position_size(
+                    capital, entry_price, sl_price, sizing_type, sizing_value
+                )
+                
+                if position_size > 0:
+                    position = {
+                        'entry_idx': i,
+                        'entry_price': entry_price,
+                        'sl': sl_price,
+                        'tp': tp_price,
+                        'size': position_size
+                    }
+            
+            # Calcul equity courante
+            current_equity = capital
+            if position is not None:
+                unrealized = (closes[i] - position['entry_price']) * position['size']
+                current_equity = capital + unrealized
+            
+            equity_curve.append(current_equity)
+        
+        equity_series = pd.Series(equity_curve, index=[df.index[0]] + list(df.index[50:]))
+        
+        return trades, equity_series
+    
+    def _generate_signals(self, df: pd.DataFrame, strategy: Dict, indicators: Dict) -> pd.Series:
+        """Génère les signaux selon la stratégie"""
+        family = strategy['family']
+        params = strategy['params']
+        
+        if family == 'RSI':
+            return self._generate_rsi_signals(df, params, indicators)
+        elif family == 'EMA':
+            return self._generate_ema_signals(df, params, indicators)
+        elif family == 'BB':
+            return self._generate_bb_signals(df, params, indicators)
+        elif family == 'MACD':
+            return self._generate_macd_signals(df, params, indicators)
+        else:
+            return pd.Series(False, index=df.index)
+    
+    def _generate_rsi_signals(self, df: pd.DataFrame, params: Dict, indicators: Dict) -> pd.Series:
+        """Signaux RSI"""
+        period = params['period']
+        buy_thresh = params['buy_threshold']
+        signal_type = params['signal_type']
+        
+        rsi_key = f"rsi_{period}"
+        rsi = indicators.get(rsi_key, TechnicalIndicators.rsi(df['close'], period))
+        
+        if signal_type == 'CROSS':
+            return (rsi <= buy_thresh) & (rsi.shift(1) > buy_thresh)
+        elif signal_type == 'CROSS_CONFIRM':
+            return (rsi <= buy_thresh) & (rsi.shift(1) <= buy_thresh) & (rsi.shift(2) > buy_thresh)
+        else:
+            return pd.Series(False, index=df.index)
+    
+    def _generate_ema_signals(self, df: pd.DataFrame, params: Dict, indicators: Dict) -> pd.Series:
+        """Signaux EMA"""
+        ema_type = params['type']
+        
+        if ema_type == 'TOUCH':
+            period = params['period']
+            ema_key = f"ema_{period}"
+            ema = indicators.get(ema_key, TechnicalIndicators.ema(df['close'], period))
+            return (df['low'] <= ema) & (df['close'] > ema)
+        
+        elif ema_type == 'CROSSOVER':
+            period = params['period']
+            ema_key = f"ema_{period}"
+            ema = indicators.get(ema_key, TechnicalIndicators.ema(df['close'], period))
+            return (df['close'] > ema) & (df['close'].shift(1) <= ema.shift(1))
+        
+        elif ema_type == 'FAST_SLOW_CROSS':
+            fast = params['fast_period']
+            slow = params['slow_period']
+            
+            ema_fast_key = f"ema_{fast}"
+            ema_slow_key = f"ema_{slow}"
+            
+            ema_fast = indicators.get(ema_fast_key, TechnicalIndicators.ema(df['close'], fast))
+            ema_slow = indicators.get(ema_slow_key, TechnicalIndicators.ema(df['close'], slow))
+            
+            return (ema_fast > ema_slow) & (ema_fast.shift(1) <= ema_slow.shift(1))
+        
+        else:
+            return pd.Series(False, index=df.index)
+    
+    def _generate_bb_signals(self, df: pd.DataFrame, params: Dict, indicators: Dict) -> pd.Series:
+        """Signaux Bollinger Bands"""
+        bb_type = params['type']
+        period = params['period']
+        std = params['std_dev']
+        
+        bb_key = f"bb_{period}_{std}"
+        upper_key = f"{bb_key}_upper"
+        lower_key = f"{bb_key}_lower"
+        
+        if upper_key not in indicators or lower_key not in indicators:
+            upper, middle, lower = TechnicalIndicators.bollinger_bands(df['close'], period, std)
+        else:
+            upper = indicators[upper_key]
+            lower = indicators[lower_key]
+        
+        if bb_type == 'TOUCH_LOWER':
+            return (df['low'] <= lower) & (df['close'] > lower)
+        elif bb_type == 'BREAKOUT':
+            return df['close'] < lower
+        elif bb_type == 'REENTRY':
+            was_outside = (df['close'].shift(1) > upper.shift(1)) | (df['close'].shift(1) < lower.shift(1))
+            is_inside = (df['close'] <= upper) & (df['close'] >= lower)
+            return was_outside & is_inside
+        else:
+            return pd.Series(False, index=df.index)
+    
+    def _generate_macd_signals(self, df: pd.DataFrame, params: Dict, indicators: Dict) -> pd.Series:
+        """Signaux MACD"""
+        fast = params['fast']
+        slow = params['slow']
+        signal = params['signal']
+        macd_type = params['type']
+        
+        macd_line, signal_line, histogram = TechnicalIndicators.macd(
+            df['close'], fast, slow, signal
         )
         
-        trades, equity = run_backtest(ticker, timeframe, df, strategy_config, risk_config)
+        if macd_type == 'CROSSOVER':
+            return (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
+        elif macd_type == 'ZERO_CROSS':
+            return (macd_line > 0) & (macd_line.shift(1) <= 0)
+        else:
+            return pd.Series(False, index=df.index)
+    
+    def _create_trade(self, trade_id: int, ticker: str, timeframe: str,
+                     entry_idx: int, exit_idx: int, entry_price: float,
+                     exit_price: float, position_size: float, pnl_net: float,
+                     exit_reason: str, df: pd.DataFrame, indicators: Dict,
+                     strategy: Dict) -> Trade:
+        """Crée un objet Trade enrichi avec le contexte"""
         
-        if len(trades) < Config.MIN_TRADES:
+        # Contexte technique à l'entrée
+        entry_rsi_14 = indicators.get('rsi_14', pd.Series(50, index=df.index)).iloc[entry_idx]
+        entry_ema_20 = indicators.get('ema_20', pd.Series(0, index=df.index)).iloc[entry_idx]
+        entry_adx = indicators.get('adx_14', pd.Series(0, index=df.index)).iloc[entry_idx]
+        entry_atr = indicators.get('atr_14', pd.Series(0, index=df.index)).iloc[entry_idx]
+        entry_volume = df['volume'].iloc[entry_idx]
+        entry_volume_ratio = indicators.get('volume_ratio', pd.Series(1, index=df.index)).iloc[entry_idx]
+        
+        # Régime marché
+        adx_val = entry_adx
+        atr_val = entry_atr
+        atr_median = indicators.get('atr_14', pd.Series(0, index=df.index)).rolling(100).median().iloc[entry_idx]
+        
+        if adx_val > 25:
+            market_regime = 'TRENDING'
+            trend_strength = 'STRONG' if adx_val > 35 else 'WEAK'
+        else:
+            market_regime = 'RANGING'
+            trend_strength = 'NEUTRAL'
+        
+        volatility_regime = 'HIGH' if atr_val > atr_median * 1.5 else 'NORMAL'
+        volume_regime = 'HIGH' if entry_volume_ratio > 1.5 else 'NORMAL'
+        
+        # Structure prix
+        support, resistance = MarketContext.calculate_support_resistance(df)
+        distance_to_support = ((df['close'].iloc[entry_idx] - support.iloc[entry_idx]) / 
+                              support.iloc[entry_idx] * 100) if support.iloc[entry_idx] > 0 else 0
+        distance_to_resistance = ((resistance.iloc[entry_idx] - df['close'].iloc[entry_idx]) / 
+                                 df['close'].iloc[entry_idx] * 100) if df['close'].iloc[entry_idx] > 0 else 0
+        
+        # Momentum
+        rsi_slope = (entry_rsi_14 - indicators.get('rsi_14', pd.Series(50, index=df.index)).iloc[entry_idx-5]) / 5
+        macd_hist = 0  # À calculer si nécessaire
+        
+        # Contexte temporel
+        entry_time = df.index[entry_idx]
+        session = MarketContext.calculate_session(entry_time)
+        hour_of_day = entry_time.hour
+        day_of_week = entry_time.weekday()
+        month = entry_time.month
+        quarter = (month - 1) // 3 + 1
+        is_weekend = day_of_week >= 5
+        
+        # Calcul durée
+        exit_time = df.index[exit_idx]
+        duration_bars = exit_idx - entry_idx
+        duration_hours = duration_bars * {'M15': 0.25, 'H1': 1, 'H4': 4, 'D1': 24, 'W1': 168}.get(timeframe, 1)
+        
+        # Création du trade
+        return Trade(
+            trade_id=f"{ticker}_{timeframe}_{trade_id}",
+            strategy_id=f"{strategy['family']}_{hashlib.md5(json.dumps(strategy['params']).encode()).hexdigest()[:8]}",
+            ticker=ticker,
+            timeframe=timeframe,
+            entry_timestamp=str(entry_time),
+            exit_timestamp=str(exit_time),
+            duration_bars=duration_bars,
+            duration_hours=duration_hours,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            stop_loss_price=entry_price * 0.98,  # Simplifié
+            take_profit_price=entry_price * 1.03,  # Simplifié
+            position_size=position_size,
+            position_value_usd=entry_price * position_size,
+            pnl_absolute=pnl_net,
+            pnl_percentage=(pnl_net / (entry_price * position_size)) * 100 if (entry_price * position_size) > 0 else 0,
+            pnl_commission=(entry_price + exit_price) * position_size * self.config.COMMISSION_RATE,
+            pnl_slippage=(entry_price + exit_price) * position_size * self.config.SLIPPAGE_RATE,
+            pnl_net=pnl_net,
+            exit_reason=exit_reason,
+            exit_type=exit_reason,
+            entry_rsi_14=float(entry_rsi_14),
+            entry_ema_20=float(entry_ema_20),
+            entry_bb_width_pct=0.0,  # À calculer
+            entry_adx=float(entry_adx),
+            entry_atr=float(entry_atr),
+            entry_atr_pct=float((entry_atr / entry_price) * 100) if entry_price > 0 else 0,
+            entry_volume=float(entry_volume),
+            entry_volume_ratio=float(entry_volume_ratio),
+            market_regime=market_regime,
+            trend_strength=trend_strength,
+            volatility_regime=volatility_regime,
+            volume_regime=volume_regime,
+            distance_to_support_pct=float(distance_to_support),
+            distance_to_resistance_pct=float(distance_to_resistance),
+            price_position_in_range=float((df['close'].iloc[entry_idx] - support.iloc[entry_idx]) / 
+                                         (resistance.iloc[entry_idx] - support.iloc[entry_idx]) 
+                                         if resistance.iloc[entry_idx] > support.iloc[entry_idx] else 0.5),
+            is_swing_low=False,  # À calculer
+            is_swing_high=False,  # À calculer
+            rsi_slope_5=float(rsi_slope),
+            macd_histogram=float(macd_hist),
+            momentum_roc_10=0.0,  # À calculer
+            candle_body_ratio=0.0,  # À calculer
+            session=session,
+            hour_of_day=hour_of_day,
+            day_of_week=day_of_week,
+            month=month,
+            quarter=quarter,
+            is_weekend=is_weekend,
+            is_market_open=not is_weekend
+        )
+
+# ============================================================================
+# CALCUL DES MÉTRIQUES BRUTES
+# ============================================================================
+
+class MetricsCalculator:
+    """Calcule les métriques brutes - PAS DE SCORE COMPOSITE"""
+    
+    @staticmethod
+    def calculate_strategy_metrics(trades: List[Trade], equity_curve: pd.Series,
+                                  strategy: Dict, ticker: str, timeframe: str,
+                                  start_date: str, end_date: str) -> StrategyMetrics:
+        """Calcule toutes les métriques brutes d'une stratégie"""
+        
+        if not trades:
             return None
         
-        metrics = calculate_metrics(ticker, timeframe, trades, equity, strategy_config, risk_config)
+        # Métriques de base
+        total_trades = len(trades)
+        winning_trades = [t for t in trades if t.pnl_net > 0]
+        losing_trades = [t for t in trades if t.pnl_net < 0]
+        break_even_trades = [t for t in trades if t.pnl_net == 0]
         
-        if metrics is None:
-            return None
+        win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
         
-        return {'metrics': metrics, 'trades': trades}
+        total_wins = sum(t.pnl_net for t in winning_trades)
+        total_losses = abs(sum(t.pnl_net for t in losing_trades))
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
         
-    except Exception as e:
-        return None
+        expectancy = (win_rate / 100 * np.mean([t.pnl_percentage for t in winning_trades]) + 
+                     ((100 - win_rate) / 100 * np.mean([t.pnl_percentage for t in losing_trades]))) if winning_trades and losing_trades else 0
+        
+        total_return_usd = equity_curve.iloc[-1] - equity_curve.iloc[0] if len(equity_curve) > 0 else 0
+        total_return_pct = (total_return_usd / equity_curve.iloc[0] * 100) if equity_curve.iloc[0] > 0 else 0
+        
+        # Risk metrics
+        max_dd_pct, max_dd_usd, dd_duration = MetricsCalculator._calculate_drawdown(equity_curve)
+        sharpe, sortino = MetricsCalculator._calculate_risk_adjusted_returns(equity_curve, timeframe)
+        calmar = (total_return_pct / max_dd_pct) if max_dd_pct > 0 else 0
+        
+        # Trade statistics
+        avg_win_pct = np.mean([t.pnl_percentage for t in winning_trades]) if winning_trades else 0
+        avg_loss_pct = np.mean([t.pnl_percentage for t in losing_trades]) if losing_trades else 0
+        avg_trade_duration = np.mean([t.duration_hours for t in trades]) if trades else 0
+        
+        # Distribution
+        pnl_values = [t.pnl_percentage for t in trades]
+        pnl_skewness = pd.Series(pnl_values).skew() if len(pnl_values) > 2 else 0
+        pnl_kurtosis = pd.Series(pnl_values).kurtosis() if len(pnl_values) > 3 else 0
+        
+        # Walk-forward (simplifié pour cette version)
+        wf_results = json.dumps({'fold_1': {'win_rate': win_rate, 'profit_factor': profit_factor}})
+        
+        # Performance par régime (simplifié)
+        performance_by_regime = json.dumps({
+            'trending': {'win_rate': win_rate, 'profit_factor': profit_factor},
+            'ranging': {'win_rate': win_rate, 'profit_factor': profit_factor}
+        })
+        
+        return StrategyMetrics(
+            strategy_id=f"{strategy['family']}_{hashlib.md5(json.dumps(strategy['params']).encode()).hexdigest()[:8]}",
+            strategy_family=strategy['family'],
+            strategy_params=strategy['params'],
+            risk_params={},  # À remplir
+            filter_params={},  # À remplir
+            ticker=ticker,
+            timeframe=timeframe,
+            total_trades=total_trades,
+            winning_trades=len(winning_trades),
+            losing_trades=len(losing_trades),
+            break_even_trades=len(break_even_trades),
+            win_rate=float(win_rate),
+            profit_factor=float(profit_factor),
+            expectancy=float(expectancy),
+            total_return_pct=float(total_return_pct),
+            total_return_usd=float(total_return_usd),
+            max_drawdown_pct=float(max_dd_pct),
+            max_drawdown_usd=float(max_dd_usd),
+            max_drawdown_duration_days=int(dd_duration),
+            avg_drawdown_pct=float(max_dd_pct / 2),  # Simplifié
+            sharpe_ratio=float(sharpe),
+            sortino_ratio=float(sortino),
+            calmar_ratio=float(calmar),
+            ulcer_index=float(max_dd_pct / 10),  # Simplifié
+            var_95=float(-max_dd_pct * 0.8),  # Simplifié
+            avg_win_pct=float(avg_win_pct),
+            avg_loss_pct=float(avg_loss_pct),
+            avg_trade_duration_hours=float(avg_trade_duration),
+            max_consecutive_wins=0,  # À calculer
+            max_consecutive_losses=0,  # À calculer
+            avg_bars_held=float(np.mean([t.duration_bars for t in trades]) if trades else 0),
+            time_in_market_pct=float(avg_trade_duration * total_trades / (24 * 365) * 100) if total_trades > 0 else 0,
+            pnl_skewness=float(pnl_skewness),
+            pnl_kurtosis=float(pnl_kurtosis),
+            win_pnl_std=float(np.std([t.pnl_percentage for t in winning_trades]) if winning_trades else 0),
+            loss_pnl_std=float(np.std([t.pnl_percentage for t in losing_trades]) if losing_trades else 0),
+            wf_results=wf_results,
+            wf_win_rate_stability=1.0,
+            wf_profit_factor_stability=1.0,
+            wf_degradation_score=1.0,
+            performance_by_regime=performance_by_regime,
+            volatility_sensitivity=0.5,
+            trend_sensitivity=0.5,
+            volume_sensitivity=0.5,
+            time_sensitivity=0.5,
+            liquidity_sensitivity=0.5,
+            data_points_used=len(equity_curve),
+            data_quality=1.0,
+            calculation_time_seconds=0.0,
+            test_period_start=start_date,
+            test_period_end=end_date
+        )
+    
+    @staticmethod
+    def _calculate_drawdown(equity_curve: pd.Series) -> Tuple[float, float, int]:
+        """Calcule le drawdown maximum"""
+        if len(equity_curve) == 0:
+            return 0.0, 0.0, 0
+        
+        peak = equity_curve.expanding().max()
+        drawdown = (peak - equity_curve) / peak * 100
+        
+        max_dd_pct = drawdown.max()
+        max_dd_idx = drawdown.argmax()
+        max_dd_usd = (peak.iloc[max_dd_idx] - equity_curve.iloc[max_dd_idx]) if max_dd_idx < len(equity_curve) else 0
+        
+        # Durée du drawdown
+        dd_duration = 0
+        in_dd = False
+        current_dd = 0
+        
+        for dd in drawdown:
+            if dd > 0:
+                if not in_dd:
+                    in_dd = True
+                current_dd += 1
+            else:
+                if in_dd:
+                    dd_duration = max(dd_duration, current_dd)
+                    in_dd = False
+                    current_dd = 0
+        
+        return float(max_dd_pct), float(max_dd_usd), dd_duration
+    
+    @staticmethod
+    def _calculate_risk_adjusted_returns(equity_curve: pd.Series, timeframe: str) -> Tuple[float, float]:
+        """Calcule Sharpe et Sortino ratios"""
+        if len(equity_curve) < 2:
+            return 0.0, 0.0
+        
+        returns = equity_curve.pct_change().dropna()
+        
+        if len(returns) == 0 or returns.std() == 0:
+            return 0.0, 0.0
+        
+        # Annualization factor
+        bars_per_year = {'M15': 252*24*4, 'H1': 252*24, 'H4': 252*6, 'D1': 252, 'W1': 52}
+        annual_factor = np.sqrt(bars_per_year.get(timeframe, 252))
+        
+        sharpe = (returns.mean() / returns.std()) * annual_factor
+        
+        # Sortino (seulement downside deviation)
+        downside_returns = returns[returns < 0]
+        if len(downside_returns) > 0 and downside_returns.std() > 0:
+            sortino = (returns.mean() / downside_returns.std()) * annual_factor
+        else:
+            sortino = 0.0
+        
+        return float(sharpe), float(sortino)
 
-def optimize_timeframe_parallel(ticker: str, timeframe: str, df: pd.DataFrame) -> Tuple[List[StrategyMetrics], List[Trade]]:
-    """Version parallélisée pour le mode FULL"""
-    print(f"\n{'='*70}")
-    print(f"🔍 {ticker} | {timeframe}")
-    print('='*70)
-    
-    combos = generate_combinations()
-    
-    # Préparer les données pour le multiprocessing
-    df_data = {
-        'data': {col: df[col].tolist() for col in df.columns},
-        'index': df.index.strftime('%Y-%m-%d %H:%M:%S').tolist(),
-        'columns': df.columns.tolist()
-    }
-    
-    # Créer les tâches
-    tasks = [(ticker, timeframe, strat, risk, df_data) for strat, risk in combos]
-    
-    all_metrics = []
-    all_trades = []
-    
-    print(f"  ⚡ Using {Config.WORKERS} parallel workers")
-    print(f"  📈 Testing {len(tasks)} combinations...")
-    
-    start_time = time.time()
-    
-    # Utiliser multiprocessing pour le mode FULL
-    with Pool(processes=Config.WORKERS) as pool:
-        # Diviser en chunks pour mieux gérer la mémoire
-        chunk_size = max(100, len(tasks) // (Config.WORKERS * 4))
-        results = list(pool.imap(backtest_worker, tasks, chunksize=chunk_size))
-    
-    # Traiter les résultats
-    for result in results:
-        if result:
-            all_metrics.append(result['metrics'])
-            if result['trades']:
-                all_trades.extend(result['trades'])
-    
-    elapsed = time.time() - start_time
-    print(f"  ⏱️  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-    
-    # Trier par score
-    all_metrics.sort(key=lambda x: x.composite_score, reverse=True)
-    
-    print(f"  ✅ {len(all_metrics)} valid strategies found")
-    
-    if all_metrics:
-        print(f"\n  🏆 TOP 5:")
-        for i, m in enumerate(all_metrics[:5], 1):
-            trades_hour = (m.trades_per_month * 12) / (24 * 365) if m.avg_trade_duration_days > 0 else 0
-            print(f"    {i}. {m.strategy_type:15} | Score={m.composite_score:5.1f} | "
-                  f"PF={m.profit_factor:4.2f} | WR={m.win_rate:5.1f}% | "
-                  f"Trades={m.total_trades:3d}")
-    
-    return all_metrics, all_trades
+# ============================================================================
+# WALK-FORWARD VALIDATOR
+# ============================================================================
 
-def save_results(all_metrics: List[StrategyMetrics], all_trades: List[Trade]):
-    print(f"\n{'='*70}")
-    print("💾 SAVING RESULTS")
-    print('='*70)
+class WalkForwardValidator:
+    """Validation walk-forward en 5 folds"""
     
-    if not all_metrics:
-        print("  ❌ No results to save")
-        return
+    def __init__(self, config: Config):
+        self.config = config
     
-    # Sauvegarder les métriques
-    df_metrics = pd.DataFrame([asdict(m) for m in all_metrics])
-    df_metrics['strategy_params_str'] = df_metrics['strategy_params'].apply(str)
-    df_metrics['risk_params_str'] = df_metrics['risk_params'].apply(str)
+    def validate(self, df: pd.DataFrame, strategy: Dict, indicators: Dict,
+                ticker: str, timeframe: str) -> List[StrategyMetrics]:
+        """Exécute la validation walk-forward en 5 folds"""
+        
+        folds = self._create_folds(df)
+        all_metrics = []
+        
+        for fold_num, (train_df, test_df) in enumerate(folds):
+            # Backtest sur train
+            backtest_engine = VectorizedBacktestEngine(self.config)
+            train_trades, train_equity = backtest_engine.run_backtest(
+                train_df, strategy, indicators, ticker, timeframe
+            )
+            
+            if not train_trades:
+                continue
+            
+            # Calcul métriques train
+            train_metrics = MetricsCalculator.calculate_strategy_metrics(
+                train_trades, train_equity, strategy, ticker, timeframe,
+                str(train_df.index[0]), str(train_df.index[-1])
+            )
+            
+            # Backtest sur test
+            test_trades, test_equity = backtest_engine.run_backtest(
+                test_df, strategy, indicators, ticker, timeframe
+            )
+            
+            if not test_trades:
+                continue
+            
+            # Calcul métriques test
+            test_metrics = MetricsCalculator.calculate_strategy_metrics(
+                test_trades, test_equity, strategy, ticker, timeframe,
+                str(test_df.index[0]), str(test_df.index[-1])
+            )
+            
+            # Enrichir avec les résultats walk-forward
+            if train_metrics and test_metrics:
+                train_metrics.wf_results = json.dumps({
+                    f'fold_{fold_num}': {
+                        'train': {'win_rate': train_metrics.win_rate, 
+                                 'profit_factor': train_metrics.profit_factor},
+                        'test': {'win_rate': test_metrics.win_rate, 
+                                'profit_factor': test_metrics.profit_factor}
+                    }
+                })
+                
+                train_metrics.wf_degradation_score = min(
+                    test_metrics.win_rate / train_metrics.win_rate if train_metrics.win_rate > 0 else 1,
+                    test_metrics.profit_factor / train_metrics.profit_factor if train_metrics.profit_factor > 0 else 1
+                )
+                
+                all_metrics.append(train_metrics)
+        
+        return all_metrics
     
-    metrics_file = Config.OUTPUT_DIR / 'all_metrics.csv'
-    df_metrics.to_csv(metrics_file, index=False)
-    print(f"  ✅ Metrics: {len(df_metrics)} strategies ({metrics_file.name})")
+    def _create_folds(self, df: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+        """Crée 5 folds temporels"""
+        folds = []
+        total_len = len(df)
+        fold_size = total_len // self.config.WF_FOLDS
+        
+        for i in range(self.config.WF_FOLDS - 1):
+            train_end = (i + 1) * fold_size
+            test_end = (i + 2) * fold_size
+            
+            train_df = df.iloc[:train_end]
+            test_df = df.iloc[train_end:test_end]
+            
+            folds.append((train_df, test_df))
+        
+        # Dernier fold
+        train_df = df.iloc[: (self.config.WF_FOLDS - 1) * fold_size]
+        test_df = df.iloc[(self.config.WF_FOLDS - 1) * fold_size:]
+        
+        folds.append((train_df, test_df))
+        
+        return folds
+
+# ============================================================================
+# GESTIONNAIRE DE MULTIPROCESSING
+# ============================================================================
+
+class MultiprocessManager:
+    """Gère le multiprocessing pour les backtests"""
     
-    # Top 200 stratégies
-    top_200 = df_metrics.nlargest(min(200, len(df_metrics)), 'composite_score')
-    top_file = Config.OUTPUT_DIR / 'top_strategies.csv'
-    top_200.to_csv(top_file, index=False)
-    print(f"  ✅ Top strategies: {top_file.name}")
+    def __init__(self, config: Config):
+        self.config = config
+        self.results = []
     
-    # Statistiques par timeframe
-    summary = {}
-    for tf in Config.TIMEFRAMES:
-        tf_data = df_metrics[df_metrics['timeframe'] == tf]
-        if len(tf_data) > 0:
-            best = tf_data.iloc[0]
-            summary[tf] = {
-                'count': len(tf_data),
-                'avg_composite': float(tf_data['composite_score'].mean()),
-                'avg_profit_factor': float(tf_data['profit_factor'].mean()),
-                'avg_win_rate': float(tf_data['win_rate'].mean()),
-                'best_strategy': best['strategy_type'],
-                'best_composite': float(best['composite_score']),
-                'best_profit_factor': float(best['profit_factor'])
-            }
+    def run_backtests_parallel(self, all_data: Dict, all_strategies: List[Dict]) -> Tuple[List[Trade], List[StrategyMetrics]]:
+        """Exécute tous les backtests en parallèle"""
+        
+        print(f"⚡ Lancement de {len(all_strategies)} stratégies sur {self.config.CPU_CORES} cores...")
+        
+        # Préparer les tâches
+        tasks = []
+        for (ticker, timeframe), df in all_data.items():
+            for strategy in all_strategies:
+                tasks.append((ticker, timeframe, df, strategy))
+        
+        # Exécution parallèle
+        all_trades = []
+        all_metrics = []
+        
+        with ProcessPoolExecutor(max_workers=self.config.CPU_CORES) as executor:
+            futures = []
+            
+            for task in tasks:
+                future = executor.submit(self._run_single_backtest_task, task)
+                futures.append(future)
+            
+            # Collecter les résultats
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Backtesting"):
+                try:
+                    trades, metrics = future.result(timeout=300)
+                    if trades:
+                        all_trades.extend(trades)
+                    if metrics:
+                        all_metrics.extend(metrics)
+                except Exception as e:
+                    print(f"❌ Erreur dans le backtest: {e}")
+                    continue
+        
+        print(f"✅ {len(all_trades)} trades générés, {len(all_metrics)} stratégies évaluées")
+        
+        return all_trades, all_metrics
     
-    summary_file = Config.OUTPUT_DIR / 'summary.json'
-    with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
-    print(f"  ✅ Summary: {summary_file.name}")
+    def _run_single_backtest_task(self, task: Tuple) -> Tuple[List[Trade], List[StrategyMetrics]]:
+        """Tâche individuelle de backtest"""
+        ticker, timeframe, df, strategy = task
+        
+        # Créer le cache d'indicateurs
+        cache = IndicatorsCache(self.config)
+        indicators = cache.precompute_for_data(df, ticker, timeframe)
+        
+        # Valider avec walk-forward
+        validator = WalkForwardValidator(self.config)
+        metrics = validator.validate(df, strategy, indicators, ticker, timeframe)
+        
+        # Récupérer les trades du premier fold (pour l'export)
+        backtest_engine = VectorizedBacktestEngine(self.config)
+        trades, _ = backtest_engine.run_backtest(df, strategy, indicators, ticker, timeframe)
+        
+        return trades, metrics
+
+# ============================================================================
+# EXPORT DE DONNÉES
+# ============================================================================
+
+class DataExporter:
+    """Exporte les données au format Parquet optimisé"""
     
-    # Sauvegarder les trades
-    if all_trades:
-        trades_file = Config.OUTPUT_DIR / 'all_trades.csv'
-        df_trades = pd.DataFrame([asdict(t) for t in all_trades])
-        df_trades.to_csv(trades_file, index=False)
-        print(f"  ✅ Trades: {len(df_trades)} trades ({trades_file.name})")
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def export_all(self, trades: List[Trade], metrics: List[StrategyMetrics]):
+        """Exporte toutes les données"""
+        
+        print("\n💾 Export des données...")
+        
+        # Export des trades
+        if trades:
+            trades_df = pd.DataFrame([asdict(t) for t in trades])
+            self._export_parquet(trades_df, "trades_detailed")
+            print(f"  ✅ Trades: {len(trades_df)} enregistrements")
+        
+        # Export des métriques de stratégies
+        if metrics:
+            metrics_dicts = []
+            for m in metrics:
+                m_dict = asdict(m)
+                # Sérialiser les dictionnaires en JSON
+                m_dict['strategy_params'] = json.dumps(m_dict['strategy_params'])
+                m_dict['risk_params'] = json.dumps(m_dict['risk_params'])
+                m_dict['filter_params'] = json.dumps(m_dict['filter_params'])
+                metrics_dicts.append(m_dict)
+            
+            metrics_df = pd.DataFrame(metrics_dicts)
+            self._export_parquet(metrics_df, "strategies_summary")
+            print(f"  ✅ Stratégies: {len(metrics_df)} enregistrements")
+        
+        # Sauvegarder la configuration
+        self._save_config()
+        
+        print(f"\n🎉 Dataset sauvegardé dans: {self.config.OUTPUT_DIR}")
     
-    # Sauvegarder la configuration
-    config_summary = {
-        'timestamp': Config.timestamp,
-        'total_combinations': Config.total_combinations(),
-        'tickers': {
-            'crypto': list(Config.CRYPTO_TICKERS.keys()),
-            'stocks': Config.STOCK_TICKERS
-        },
-        'timeframes': list(Config.TIMEFRAMES.keys()),
-        'mode': Config.MODE,
-        'workers': Config.WORKERS
-    }
+    def _export_parquet(self, df: pd.DataFrame, filename: str):
+        """Export un DataFrame en Parquet optimisé"""
+        
+        # Optimiser les types
+        df_optimized = self._optimize_dtypes(df)
+        
+        # Chemin de sortie
+        output_path = self.config.OUTPUT_DIR / f"{filename}.parquet"
+        
+        # Exporter
+        df_optimized.to_parquet(
+            output_path,
+            engine='pyarrow',
+            compression=self.config.COMPRESSION,
+            index=False
+        )
     
-    config_file = Config.OUTPUT_DIR / 'config.json'
-    with open(config_file, 'w') as f:
-        json.dump(config_summary, f, indent=2)
-    print(f"  ✅ Configuration: {config_file.name}")
+    def _optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Optimise les types de données pour réduire la taille"""
+        
+        for col in df.columns:
+            col_type = df[col].dtype
+            
+            if col_type == 'float64':
+                # Convertir en float32 si possible
+                df[col] = df[col].astype('float32')
+            
+            elif col_type == 'int64':
+                # Trouver le bon type entier
+                col_min = df[col].min()
+                col_max = df[col].max()
+                
+                if col_min >= 0:
+                    if col_max < 255:
+                        df[col] = df[col].astype('uint8')
+                    elif col_max < 65535:
+                        df[col] = df[col].astype('uint16')
+                    elif col_max < 4294967295:
+                        df[col] = df[col].astype('uint32')
+                else:
+                    if col_min > -128 and col_max < 127:
+                        df[col] = df[col].astype('int8')
+                    elif col_min > -32768 and col_max < 32767:
+                        df[col] = df[col].astype('int16')
+                    elif col_min > -2147483648 and col_max < 2147483647:
+                        df[col] = df[col].astype('int32')
+        
+        return df
+    
+    def _save_config(self):
+        """Sauvegarde la configuration utilisée"""
+        config_dict = {
+            k: v for k, v in vars(self.config).items() 
+            if not k.startswith('_') and not callable(v)
+        }
+        
+        config_path = self.config.OUTPUT_DIR / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2, default=str)
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 def main():
-    print("\n╔" + "═"*76 + "╗")
-    print("║" + " BACKTEST ENGINE v14.0 - FULL MODE OPTIMIZED ".center(76) + "║")
-    print("╚" + "═"*76 + "╝\n")
+    """Point d'entrée principal"""
     
-    if not HAS_YFINANCE:
-        print("❌ Please install: pip install yfinance pandas numpy")
+    print("\n" + "="*80)
+    print("🚀 BACKTEST ENGINE v15 - GÉNÉRATEUR DE DATASET POUR IA")
+    print("="*80 + "\n")
+    
+    # Initialisation
+    start_time = time.time()
+    config = Config()
+    
+    print(f"📊 Configuration:")
+    print(f"   Actifs: {len(config.CRYPTO_TICKERS)} crypto + {len(config.STOCK_TICKERS)} actions")
+    print(f"   Timeframes: {list(config.TIMEFRAMES.keys())}")
+    print(f"   Cores CPU: {config.CPU_CORES}")
+    print(f"   Sortie: {config.OUTPUT_DIR}\n")
+    
+    # 1. Téléchargement des données
+    print("📥 Étape 1: Téléchargement des données...")
+    data_fetcher = DataFetcher(config)
+    all_data = data_fetcher.fetch_all_data()
+    
+    if not all_data:
+        print("❌ Aucune donnée téléchargée")
         return
     
-    print(f"⚙️  CONFIGURATION:")
-    print(f"   Mode: {Config.MODE}")
-    print(f"   Workers: {Config.WORKERS}")
-    print(f"   Output: {Config.OUTPUT_DIR}")
-    print(f"   Cache: {'Enabled' if Config.USE_DISK_CACHE else 'Disabled'}")
+    print(f"✅ {len(all_data)} datasets téléchargés\n")
     
-    total_actifs = len(Config.CRYPTO_TICKERS) + len(Config.STOCK_TICKERS)
-    total_timeframes = len(Config.TIMEFRAMES)
-    total_combos = Config.total_combinations()
+    # 2. Génération des stratégies
+    print("🧠 Étape 2: Génération des stratégies brute force...")
+    strategy_gen = StrategyGenerator(config)
+    all_strategies = strategy_gen.generate_all_strategies()
     
-    print(f"\n📊 SCOPE:")
-    print(f"   Assets: {total_actifs} ({len(Config.CRYPTO_TICKERS)} crypto, {len(Config.STOCK_TICKERS)} stocks)")
-    print(f"   Timeframes: {total_timeframes}")
-    print(f"   Tests per asset/timeframe: ~{total_combos}")
-    print(f"   Total tests: ~{total_actifs * total_timeframes * total_combos:,}")
-    print(f"   Estimated time: 4-8 hours (with {Config.WORKERS} workers)")
+    # Limiter pour les tests (commenter pour la version complète)
+    all_strategies = all_strategies[:100]  # TEST: 100 stratégies seulement
+    print(f"🔬 TEST MODE: {len(all_strategies)} stratégies seulement\n")
     
-    print(f"\n{'='*70}")
-    print("📥 DOWNLOADING DATA")
-    print('='*70)
+    # 3. Backtests parallèles
+    print("⚡ Étape 3: Backtests parallèles...")
+    mp_manager = MultiprocessManager(config)
+    all_trades, all_metrics = mp_manager.run_backtests_parallel(all_data, all_strategies)
     
-    # Afficher le plan d'exécution
-    print("\n📋 EXECUTION PLAN:")
-    all_tickers = list(Config.CRYPTO_TICKERS.keys()) + Config.STOCK_TICKERS
-    for ticker in all_tickers:
-        for timeframe in Config.TIMEFRAMES:
-            print(f"   • {ticker} | {timeframe}")
+    # 4. Export des données
+    print("\n💾 Étape 4: Export des données...")
+    exporter = DataExporter(config)
+    exporter.export_all(all_trades, all_metrics)
     
-    downloader = DataDownloader()
-    datasets = {}
+    # Résumé final
+    end_time = time.time()
+    duration = end_time - start_time
     
-    start_download = time.time()
-    for ticker in all_tickers:
-        for timeframe in Config.TIMEFRAMES:
-            df = downloader.fetch_single(ticker, timeframe)
-            if df is not None:
-                datasets[(ticker, timeframe)] = df
+    print("\n" + "="*80)
+    print("✅ TERMINÉ AVEC SUCCÈS")
+    print("="*80)
+    print(f"   Durée totale: {duration:.1f} secondes ({duration/60:.1f} minutes)")
+    print(f"   Trades générés: {len(all_trades)}")
+    print(f"   Stratégies évaluées: {len(all_metrics)}")
+    print(f"   Dossier de sortie: {config.OUTPUT_DIR}")
+    print("="*80)
     
-    download_time = time.time() - start_download
-    print(f"\n✅ {len(datasets)} datasets ready ({download_time:.1f}s)")
-    
-    if not datasets:
-        print("\n❌ No data available")
-        return
-    
-    print(f"\n{'='*70}")
-    print("🔬 RUNNING BACKTESTS")
-    print('='*70)
-    
-    total_start = time.time()
-    all_metrics = []
-    all_trades = []
-    
-    print(f"\n⚠️  WARNING: This will take approximately 4-8 hours")
-    print("   Press Ctrl+C to stop at any time")
-    print("   Results are saved incrementally\n")
-    
-    for i, ((ticker, timeframe), df) in enumerate(datasets.items(), 1):
-        print(f"\n[{i}/{len(datasets)}] {ticker} | {timeframe}")
-        print(f"   Data: {len(df)} bars ({df.index[0].date()} to {df.index[-1].date()})")
-        
-        try:
-            metrics, trades = optimize_timeframe_parallel(ticker, timeframe, df)
-            all_metrics.extend(metrics)
-            all_trades.extend(trades)
-            
-            # Sauvegarde incrémentale
-            if metrics:
-                temp_file = Config.OUTPUT_DIR / f'partial_{ticker}_{timeframe}.csv'
-                pd.DataFrame([asdict(m) for m in metrics]).to_csv(temp_file, index=False)
-                print(f"   💾 Partial results saved: {len(metrics)} strategies")
-                
-        except KeyboardInterrupt:
-            print("\n\n⚠️  INTERRUPTED BY USER")
-            print("   Saving current results...")
-            break
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    if not all_metrics:
-        print("\n❌ No valid strategies found")
-        return
-    
-    # Sauvegarde finale
-    save_results(all_metrics, all_trades)
-    
-    total_time = time.time() - total_start
-    hours = total_time // 3600
-    minutes = (total_time % 3600) // 60
-    seconds = total_time % 60
-    
-    print(f"\n{'='*70}")
-    print("✅ COMPLETED")
-    print('='*70)
-    print(f"   Total time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-    print(f"   Strategies: {len(all_metrics)}")
-    print(f"   Trades: {len(all_trades)}")
-    print(f"   Output directory: {Config.OUTPUT_DIR}")
-    print(f"\n📈 PERFORMANCE SUMMARY:")
-    print(f"   - Average strategies per dataset: {len(all_metrics)/len(datasets):.1f}")
-    print(f"   - Average trades per dataset: {len(all_trades)/len(datasets):.1f}")
+    # Afficher un échantillon de stratégies
     if all_metrics:
-        best_score = max(m.composite_score for m in all_metrics)
-        avg_pf = np.mean([m.profit_factor for m in all_metrics])
-        avg_wr = np.mean([m.win_rate for m in all_metrics])
-        print(f"   - Best composite score: {best_score:.1f}")
-        print(f"   - Average profit factor: {avg_pf:.2f}")
-        print(f"   - Average win rate: {avg_wr:.1f}%")
-    
-    print(f"\n📁 Files created:")
-    for file in Config.OUTPUT_DIR.glob('*'):
-        if file.is_file():
-            size_mb = file.stat().st_size / (1024 * 1024)
-            print(f"   • {file.name} ({size_mb:.1f} MB)")
+        print("\n📈 Top 5 stratégies par profit factor:")
+        top_metrics = sorted(all_metrics, key=lambda x: x.profit_factor, reverse=True)[:5]
+        
+        for i, metric in enumerate(top_metrics, 1):
+            print(f"   {i}. {metric.strategy_family} - PF: {metric.profit_factor:.2f}, "
+                  f"WR: {metric.win_rate:.1f}%, Trades: {metric.total_trades}")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  INTERRUPTED")
-        print("   Partial results have been saved")
+        print("\n\n⚠️  Interrompu par l'utilisateur")
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+        print(f"\n❌ Erreur: {e}")
         import traceback
         traceback.print_exc()
