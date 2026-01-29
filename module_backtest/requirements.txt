@@ -1,10 +1,42 @@
+# Core Data & Computation
 pandas>=2.0.0
 numpy>=1.24.0
-yfinance>=0.2.33
 pyarrow>=14.0.0
-python-dateutil>=2.8.2
-pytz>=2023.3
-multiprocess>=0.70.15
-tzdata>=2023.3
 scipy>=1.10.0
 statsmodels>=0.14.0
+
+# Data Sources
+yfinance>=0.2.33
+ccxt>=4.2.0  # <-- NOUVEAU: Pour Binance API publique
+
+# Date & Time Handling
+python-dateutil>=2.8.2
+pytz>=2023.3
+tzdata>=2023.3
+
+# Parallel Processing
+multiprocess>=0.70.15
+
+# Progress Bars & Monitoring
+tqdm>=4.65.0  # <-- NOUVEAU: Pour les barres de progression
+
+# Performance & Memory Management
+numba>=0.57.0  # <-- NOUVEAU: Pour JIT compilation (optimisation optionnelle)
+dask>=2023.8.0  # <-- NOUVEAU: Pour datasets > mémoire RAM (optionnel)
+
+# Data Compression & Serialization
+joblib>=1.3.0  # <-- NOUVEAU: Pour cache sur disque
+zstandard>=0.22.0  # <-- NOUVEAU: Pour compression ZSTD
+orjson>=3.9.0  # <-- NOUVEAU: JSON ultra-rapide (optionnel)
+
+# Type Hints & Code Quality
+typing-extensions>=4.7.0
+mypy>=1.5.0  # <-- Optionnel: Pour vérification de types
+
+# Utilities
+requests>=2.31.0  # Déjà présent via yfinance/ccxt mais explicitement déclaré
+aiohttp>=3.8.5  # <-- NOUVEAU: Pour téléchargements asynchrones (optionnel)
+
+# Debug & Profiling
+memory-profiler>=0.61.0  # <-- Optionnel: Pour profiling mémoire
+line-profiler>=4.0.3  # <-- Optionnel: Pour profiling ligne par ligne
